@@ -2,7 +2,7 @@
 
 This project walks you through how yoou can deploy a ChatBot that uses the Retrieval Augmented Generation (RAG) Technique. This ChatBot is Powered by [Amazon Bedrock](https://aws.amazon.com/bedrock/)/[Amazon SageMaker JumStart](https://aws.amazon.com/sagemaker/jumpstart/) LLM/Embedding Models and uses [Amazon Kendra](https://aws.amazon.com/kendra/) and/or [Amazon OpenSearch](https://aws.amazon.com/opensearch-service/) as Vector Storage and Retrieval Engines.
 
-##PreRequisite
+## PreRequisite
 You would need to set up the following before succesfully using this app:
 1. [Create Kendra Index](https://docs.aws.amazon.com/kendra/latest/dg/create-index.html)
 2. [Create OpenSearch Domain](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/configuration-samples.html) 
