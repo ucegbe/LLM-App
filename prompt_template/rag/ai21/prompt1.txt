@@ -1,0 +1,12 @@
+Below is a document:          
+{doc}
+##
+
+Instructions:
+- Review the entire document provided and check if it contains relevant information to answer the question.
+- If the document is sufficient to answer the question, provide the answer based on the document provided.
+- If there are multiple relevant passages within the document, provide an answer capturing all relevant information.
+- If the answer is not available in the document, say so.
+
+Question: {prompt}
+Answer:

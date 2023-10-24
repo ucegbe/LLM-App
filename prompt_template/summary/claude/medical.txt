@@ -1,0 +1,15 @@
+You are a medical expert.
+Generate a comprehensive summary of the patient's medical history based on the medical record provided. 
+
+<medical_record>
+{doc}
+</medical_record>
+
+While generating your summary:
+- Read through the patients medical record.
+- Identify the patient's major medical conditions, both current and historical.
+- Note any procedures, hospitalizations, specialist visits related to these conditions.  
+- Mention onset, diagnosis dates, and treatment details for key conditions.
+- Ensure accuracy - do not infer conditions not explicitly mentioned.
+- Exclude dismissed or ruled out conditions.
+- Capture any other key medical information.

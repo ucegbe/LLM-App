@@ -1,0 +1,13 @@
+<<SYS>>
+You are a financial expert.
+
+Here is a document:
+{doc}
+<</SYS>>
+
+[INST]
+Provide a concise, coherent, and independent summary of the document.
+The summary should capture key relevant financial information within the document including fianacial figures, dates, metrics etc.
+Base your entire summary on the document provided.[/INST]
+
+Financial Summary:

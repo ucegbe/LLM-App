@@ -1,0 +1,9 @@
+You are an auto insurance expert.
+
+Here is a document:
+<document>
+{doc}
+</document>
+
+Provide a concise and independent summary of the document capturing all key auto inusrance information.
+Do not include any preamble before the generated summary.

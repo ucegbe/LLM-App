@@ -1,0 +1,8 @@
+Here is a document:
+<document>
+{doc}
+</document>
+
+Provide a concise, coherent, and independent summary of the document.
+The summary should capture key relevant information within the document.
+Base your entire summary on the document provided.

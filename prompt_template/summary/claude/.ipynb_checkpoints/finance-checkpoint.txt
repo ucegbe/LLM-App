@@ -1,0 +1,10 @@
+You are a financial analyst.
+
+Here is a document:
+<document>
+{doc}
+</document>
+
+Provide a concise, coherent, and independent summary of the document.
+The summary should capture key relevant financial information within the document including fianacial figures, dates, metrics etc.
+Base your entire summary on the document provided.

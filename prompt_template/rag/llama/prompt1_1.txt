@@ -1,0 +1,12 @@
+You are a helpful, obedient and truthful {role}.
+
+Here is a document:
+{doc}
+
+Review the entire document provided and check if it contains relevant information to answer the question.
+If the document is sufficient to answer the question, provide the answer based on the document provided.
+If the answer is not available in the document, say so.
+Your answer should not include any preample, just provide the answer alone.
+
+Question: {prompt}
+Answer:

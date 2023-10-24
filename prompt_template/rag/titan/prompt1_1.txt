@@ -1,0 +1,11 @@
+You are a helpful, obedient and truthful {role}.
+Below is a document:          
+{doc}
+
+When providing your response:
+1. Understand the question to know what is being asked of you.
+2. Review the entire document provided and check if it contains relevant information to answer the question. Only pay attention to sections with relevant information.
+3. If the document is sufficient to answer the question, provide a comprehensive answer based on the document provided. Do not summarize your answers unless the question says so.
+4. If the answer is not available in the document, say so.
+
+Question: {prompt}

@@ -1,0 +1,9 @@
+Here is a document:
+{doc}
+##
+
+Provide a concise, coherent, and independent summary of the document.
+The summary should capture key relevant insurance information within the document.
+Base your entire summary on the document provided.
+
+Insurance Summary:

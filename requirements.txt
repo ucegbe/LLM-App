@@ -1,0 +1,15 @@
+boto3
+pandas
+streamlit
+pillow
+PyPDF2
+tiktoken
+tqdm
+yaml
+anthropic
+sentencepiece
+aspose-words
+streamlit_chat 
+pymupdf
+tokenizers
+transformers
