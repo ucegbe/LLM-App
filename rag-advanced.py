@@ -180,9 +180,9 @@ def create_os_index(param, file_location):
             }
           }
         }
-    response = requests.head(URL, auth=HTTPBasicAuth(es_username, es_password))  
+    response = requests.head(URL, auth=HTTPBasicAuth(es_username, es_password),timeout=240)  
     if response.status_code == 404:
-        response = requests.put(URL, auth=HTTPBasicAuth(es_username, es_password), json=mapping)
+        response = requests.put(URL, auth=HTTPBasicAuth(es_username, es_password), json=mapping,timeout=240)
         st.write(f'Index created: {response.text}')
     else:
         st.write('Index already exists!')
@@ -219,7 +219,7 @@ def create_os_index(param, file_location):
             'passage_id': chunk_id,
             'passage': chunk, 
             'embedding': embedding}
-        response = requests.post(f'{URL}/_doc/{i}', auth=HTTPBasicAuth(es_username, es_password), json=document)
+        response = requests.post(f'{URL}/_doc/{i}', auth=HTTPBasicAuth(es_username, es_password), json=document,timeout=120)
         i += 1
         if response.status_code not in [200, 201]:
             logger.error(response.status_code)
@@ -628,13 +628,13 @@ def load_document(file_bytes, doc_name, param):
         inputpdf = PdfReader(open(doc_name, "rb"))
         if len(inputpdf.pages)>1:
             dir_folder=split_doc(doc_name)
-            subprocess.run(["aws", "s3", "sync", dir_folder, f"s3://{BUCKET}/{PREFIX}/{dir_folder}/", "--acl", "public-read"])    
+            subprocess.run(["aws", "s3", "sync", dir_folder, f"s3://{BUCKET}/{PREFIX}/{dir_folder}/"])   
             time.sleep(3)
             st.write('Kendra Indexing')
             kendra_index(dir_folder) 
         elif len(inputpdf.pages)==1:
             dir_folder=doc_name.split('.')[0]
-            subprocess.run(["aws", "s3", "sync", doc_name, f"s3://{BUCKET}/{PREFIX}/{dir_folder}/", "--acl", "public-read"])  
+            subprocess.run(["aws", "s3", "sync", doc_name, f"s3://{BUCKET}/{PREFIX}/{dir_folder}/"])
             st.write('Kendra Indexing')
             kendra_index(dir_folder) 
     elif "OpenSearch" in param["rag"]:
@@ -730,7 +730,7 @@ def similarity_search(payload, param):
     es_password = OS_KEY 
     domain_endpoint = OS_ENDPOINT
     URL = f'{domain_endpoint}/{param["domain"]}/_search'     
-    response = requests.post(URL, auth=HTTPBasicAuth(es_username, es_password), json=query)
+    response = requests.post(URL, auth=HTTPBasicAuth(es_username, es_password), json=query, timeout=120)
     response_json = response.json()
     hits = response_json['hits']['hits']    
     return hits
@@ -936,7 +936,7 @@ def summarize_context(params):
         # save TXT as PDF file
         doc.save("txt-2-pdf.pdf", aw.SaveFormat.PDF)
         #upload to s3 and make public. Do take out the "public-read" from the call if you do not want the file to be public
-        subprocess.run(["aws", "s3", "cp", "txt-2-pdf.pdf", f"s3://{BUCKET}/{PREFIX}/txt-2-pdf.pdf", "--acl", "public-read"]) 
+        subprocess.run(["aws", "s3", "cp", "txt-2-pdf.pdf", f"s3://{BUCKET}/{PREFIX}/txt-2-pdf.pdf"])
         summary+=f"\n\n Link to pdf [summary](https://{BUCKET}.s3.amazonaws.com/{PREFIX}/txt-2-pdf.pdf)"
         st.session_state['summary'] = summary     
         st.subheader(f'Summary (in {st.session_state["elapsed"]} seconds):')
@@ -1232,3 +1232,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+  
