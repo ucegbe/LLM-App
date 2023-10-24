@@ -39,15 +39,15 @@ To run this Streamlit App on AWS EC2 (I tested this on the Ubuntu Image)
 
 ## UI Look
 The UI has Three Activities:
-1. DocumentQuery: This uses the RAG apparoach with different retrievers (OpenSearch and Kendra) and lets you select different configurations. The user can upload a pdf and get it indexed in either OpenSearch or Kendra.
+1. **DocumentQuery**: This uses the RAG apparoach with different retrievers (OpenSearch and Kendra) and lets you select different configurations. The user can upload a pdf and get it indexed in either OpenSearch or Kendra.
 
 <img src="images/docquery.JPG" width="600"/>
    
-2. Document Insights: This is a more interactive appraoch where the user uploads a document and can interact with each page of that documnet in real time. Things like QnA, Summarization etc.
+2. **Document Insights**: This is a more interactive appraoch where the user uploads a document and can interact with each page of that documnet in real time. Things like QnA, Summarization etc.
 
 <img src="images/insights.JPG" width="600"/>
 
-3. Batch Document Summary: This is an activity for Batch document summarization. The user uploads a pdf document and is able to generate a wholesome summary of the entire document.
+3. **Batch Document Summary**: This is an activity for Batch document summarization. The user uploads a pdf document and is able to generate a wholesome summary of the entire document.
 
 <img src="images/batch.JPG" width="600"/>
 
