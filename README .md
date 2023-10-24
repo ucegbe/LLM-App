@@ -7,7 +7,9 @@ You would need to set up the following before succesfully using this app:
 1. [Create Kendra Index](https://docs.aws.amazon.com/kendra/latest/dg/create-index.html)
 2. [Create OpenSearch Domain](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/configuration-samples.html) 
 3. [Deploy LLama2 Models on Amazon SageMaker](https://www.philschmid.de/sagemaker-llama-llm) (Optional)
-4. Deploy HuggingFace Embedding Models with SageMaker JumpStart (Optional)
+4. Amazon Bedrock Access to a suite of Models.
+5. Deploy HuggingFace Embedding Models with SageMaker JumpStart (Optional)
+6. Modify the application_metadata_complete.json file with the correct values of your Kendra index, OpenSearch Domain and JumpStart LLM/Embedding models as well as other information.
    
 ## Set Up StreamLit Front-End
 The streamlit app for this prioject is located in *rag_advanced.py*.
@@ -34,6 +36,23 @@ To run this Streamlit App on AWS EC2 (I tested this on the Ubuntu Image)
 * Install the dependencies in the requirements.txt file by running the command `sudo pip install -r requirements.txt`
 * Run command `python3 -m streamlit run rag_advanced.py` 
 * Copy the external link and paste in a new browser tab
+
+## UI Look
+The UI has Three Activities:
+1. DocumentQuery: This uses the RAG apparoach with different retrievers (OpenSearch and Kendra) and lets you select different configurations. The user can upload a pdf and get it indexed in either OpenSearch or Kendra.
+
+<img src="images/studio-new-launcher.png" width="600"/>
+   
+3. Document Insights: This is a more interactive appraoch where the user uploads a document and can interact with each page of that documnet in real time. Things like QnA, Summarization etc.
+
+<img src="images/studio-new-launcher.png" width="600"/>
+
+4. Batch Document Summary: This is an activity for Batch document summarization. The user uploads a pdf document and is able to generate a wholesome summary of the entire document.
+
+<img src="images/studio-new-launcher.png" width="600"/>
+
+## Note
+Only Pdf documents are supported for upload at this time using this app.
 
 ## Security
 
