@@ -622,6 +622,10 @@ def query_endpoint(params, qa_prompt):
         
 
 def load_document(file_bytes, doc_name, param):
+    try:
+        os.mkdir('file')
+    except:
+        pass
     if "Kendra" in param["rag"]:    
         with open(doc_name, 'wb') as fp:
             fp.write(file_bytes)
@@ -653,18 +657,30 @@ def load_document(file_bytes, doc_name, param):
             return domain 
         
 def load_documents(file_bytes, doc_name): 
+    try:
+        os.mkdir('file')
+    except:
+        pass
     s3_path=f"file_store/{doc_name}"
-    with open(doc_name, 'rb') as fp:
-        S3.upload_fileobj(fp, BUCKET, s3_path,ExtraArgs={'ACL': 'public-read'})     
-    time.sleep(3)
+    with open(f"file/{doc_name}", 'wb') as fp:
+        fp.write(file_bytes)
+   
+    S3.upload_file(doc_name, BUCKET, s3_path)
+    time.sleep(2)
     
     text,file_p= extract_text(BUCKET, s3_path)
     return text,file_p
 
 def load_document_single(file_bytes, doc_name):  
+    try:
+        os.mkdir('file')
+    except:
+        pass
     s3_path=f"file_store/{doc_name}"
-    with open(doc_name, 'rb') as fp:
-        S3.upload_fileobj(fp, BUCKET, s3_path)
+    with open(f"file/{doc_name}", 'wb') as fp:
+        fp.write(file_bytes)
+   
+    S3.upload_file(doc_name, BUCKET, s3_path)
     st.write('Extracting Text')
     text,file_p = extract_text_single(BUCKET, s3_path)
     return text,file_p
@@ -1054,7 +1070,7 @@ def action_doc(params):
             with st.expander(label="**Additional Response**"):
                 st.markdown(message["step"])
                     
-    if prompt := st.chat_input("Hello?"):
+    if prompt := st.chat_input(""):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -1082,17 +1098,19 @@ def action_doc(params):
             with st.expander(label="**Additional Response**"):
                 # try:
       
-                    for k in range(1, round(params["K"])):
-                        steps=f"""
-                        - **Answer {k+1}**: {output_answer[k]['Answer'].replace("$","USD ").replace("%", " percent")}
-                        - **Source:** [{k+1}]({output_answer[k]['Link']})
-                        - **Page:** {output_answer[k]['Page']} 
-                        - **Confidence:** {output_answer[k]['Score']}
-                        - **Input Token:** {output_answer[0]['Input Token']}
-                        - **Output Token:** {output_answer[0]['Output Token']}
-                        """  
-                        st.markdown(steps)            
-                        st.session_state.messages.append({"step": steps})
+                for k in range(1, round(params["K"])):
+                    steps=f"""
+                    - **Answer {k+1}**: {output_answer[k]['Answer'].replace("$","USD ").replace("%", " percent")}
+                    - **Source:** [{k+1}]({output_answer[k]['Link']})
+                    - **Page:** {output_answer[k]['Page']} 
+                    - **Confidence:** {output_answer[k]['Score']}
+                    - **Input Token:** {output_answer[0]['Input Token']}
+                    - **Output Token:** {output_answer[0]['Output Token']}
+                    """  
+                    st.markdown(steps)            
+                    st.session_state.messages.append({"step": steps})
+            # st.rerun()
+                   
                 # except:
                 #     pass
             
@@ -1130,7 +1148,7 @@ def action_doc(params):
                     """   
                     st.markdown(steps)            
                 st.session_state.messages.append({"role": "assistant", "content": output_answer[0]['Answer'], "steps":steps})
-        st.rerun()
+                # st.rerun()
 
 
 def app_sidebar():
@@ -1226,7 +1244,7 @@ def main():
     elif params['action_name'] =='Document Insights':
         if st.session_state.bytes:
             page_summary(st.session_state.bytes,params)
-    else:
+    elif params['action_name'] =='Document Query':
         action_doc(params)
 
 

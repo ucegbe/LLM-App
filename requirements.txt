@@ -5,7 +5,7 @@ pillow
 PyPDF2
 tiktoken
 tqdm
-yaml
+pyyaml
 anthropic
 sentencepiece
 aspose-words
