@@ -10,7 +10,6 @@ import time
 from PIL import Image
 from io import BytesIO
 from PyPDF2 import PdfWriter, PdfReader
-import subprocess
 import requests
 from requests.auth import HTTPBasicAuth
 import tiktoken
@@ -24,8 +23,13 @@ import uuid
 from streamlit_chat import message
 import fitz
 import io
+import json
 from tokenizers import Tokenizer
 from transformers import AutoTokenizer
+import streamlit.components.v1 as streamcomponents
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from langchain.llms.bedrock import Bedrock
+from langchain.callbacks.base import BaseCallbackHandler
 
 st.set_page_config(layout="wide")
 logger = logging.getLogger('sagemaker')
@@ -38,21 +42,23 @@ MODELS_EMB = {d['name']: d['endpoint'] for d in APP_MD['models-emb']}
 REGION    = APP_MD['region']
 BUCKET    = APP_MD['Kendra']['bucket']
 PREFIX    = APP_MD['Kendra']['prefix']
-OS_KEY = APP_MD['opensearch']['es_password']
-OS_USERNAME =  APP_MD['opensearch']['es_username']
+# OS_KEY = APP_MD['opensearch']['es_password']
+# OS_USERNAME =  APP_MD['opensearch']['es_username']
 OS_ENDPOINT  =  APP_MD['opensearch']['domain_endpoint']
 KENDRA_ID = APP_MD['Kendra']['index']
 KENDRA_ROLE=APP_MD['Kendra']['role']
 PARENT_TEMPLATE_PATH="prompt_template"
 KENDRA_S3_DATA_SOURCE_NAME=APP_MD['Kendra']['s3_data_source_name']
-
+HEIGHT=500 # Height of Streamlit container for output text
+TLS_CERT_PATH = APP_MD['tls_cert_path']
+SECRETS_NAME=APP_MD['secrets']
 
 S3            = boto3.client('s3', region_name=REGION)
 TEXTRACT      = boto3.client('textract', region_name=REGION)
 KENDRA        = boto3.client('kendra', region_name=REGION)
 SAGEMAKER     = boto3.client('sagemaker-runtime', region_name=REGION)
 BEDROCK = boto3.client(service_name='bedrock-runtime',region_name='us-east-1') 
-
+COMPREHEND=boto3.client("comprehend")
 
 EMB_MODEL_DICT={"titan":1536,
                 "minilmv2":384,
@@ -60,7 +66,8 @@ EMB_MODEL_DICT={"titan":1536,
                 "gtelarge":1024,
                 "e5largev2":1024,
                 "e5largemultilingual":1024,
-               "gptj6b":4096}
+               "gptj6b":4096,
+                "cohere":1024}
 
 EMB_MODEL_DOMAIN_NAME={"titan":f"{APP_MD['opensearch']['domain_name']}_titan",
                 "minilmv2":f"{APP_MD['opensearch']['domain_name']}_minilm",
@@ -68,10 +75,27 @@ EMB_MODEL_DOMAIN_NAME={"titan":f"{APP_MD['opensearch']['domain_name']}_titan",
                 "gtelarge":f"{APP_MD['opensearch']['domain_name']}_gtelarge",
                 "e5largev2":f"{APP_MD['opensearch']['domain_name']}_e5large",
                 "e5largemultilingual":f"{APP_MD['opensearch']['domain_name']}_e5largeml",
-               "gptj6b":f"{APP_MD['opensearch']['domain_name']}_gptj6b"}
+               "gptj6b":f"{APP_MD['opensearch']['domain_name']}_gptj6b",
+                       "cohere":f"{APP_MD['opensearch']['domain_name']}_cohere"}
 
 
-
+class StreamHandler(BaseCallbackHandler):
+    def __init__(self, container, initial_text=""):
+        self.container = container
+        self.text=initial_text
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+  
+        self.text+=token+""
+        self.text=self.text.replace("$","USD ").replace("%", " percent")
+        if st.session_state['action_name']=='Document Query' or st.session_state['action_name']=='Document Insights':
+            self.container.markdown(self.text)
+        else:
+            with self.container:
+                streamcomponents.html(
+                            "<br>"+self.text.replace("\n", "<br>"),
+                            height=HEIGHT,
+                            scrolling=True,
+                        )
 
 
 if 'generate' not in st.session_state:
@@ -102,10 +126,36 @@ if 'rtv' not in st.session_state:
     st.session_state['rtv'] = ''
 if 'page_summ' not in st.session_state:
     st.session_state['page_summ'] = ''
+if 'action_name' not in st.session_state:
+    st.session_state['action_name'] = ""
 
+def get_secret():
+    secret_name = SECRETS_NAME
+    region_name = REGION
 
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
 
-    
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except ClientError as e:
+        # For a list of exceptions thrown, see
+        # https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+        raise e
+
+    # Decrypts secret using the associated KMS key.
+    secret = get_secret_value_response['SecretString']
+    return secret 
+
+OS_KEY = json.loads(get_secret())['password']
+OS_USERNAME =  json.loads(get_secret())['username']
+
 def query_index(query):  
     response = KENDRA.retrieve(
     IndexId=KENDRA_ID,
@@ -133,7 +183,7 @@ def chunk_iterator(dir_path: str):
                     yield filename, file_contents
 
 
-def create_os_index(param, file_location):
+def create_os_index(param, chunks):
     st.write("Indexing...")    
     es_username = OS_USERNAME
     es_password = OS_KEY 
@@ -180,16 +230,17 @@ def create_os_index(param, file_location):
             }
           }
         }
-    response = requests.head(URL, auth=HTTPBasicAuth(es_username, es_password),timeout=240)  
+    response = requests.head(URL, auth=HTTPBasicAuth(es_username, es_password),timeout=60,verify= TLS_CERT_PATH if TLS_CERT_PATH else True)  
     if response.status_code == 404:
-        response = requests.put(URL, auth=HTTPBasicAuth(es_username, es_password), json=mapping,timeout=240)
+        response = requests.put(URL, auth=HTTPBasicAuth(es_username, es_password), json=mapping,timeout=240,verify= TLS_CERT_PATH if TLS_CERT_PATH else True)  
         st.write(f'Index created: {response.text}')
     else:
         st.write('Index already exists!')
         
     i = 1
-    for chunk_name, chunk in tqdm(chunk_iterator(file_location)):
-        doc_id, chunk_id = chunk_name.split('_',1)
+    # doc_id=file_name
+    for pages, chunk in chunks.items(): # Iterate through dict with chunk page# and content
+        chunk_id = pages.split('*')[0] # take care of multiple chunks in same page (*) is used as delimiter
         if "titan" in param["emb"].lower():
             prompt= {
                 "inputText": chunk
@@ -203,8 +254,20 @@ def create_os_index(param, file_location):
             response = BEDROCK.invoke_model(body=body, modelId=modelId, accept=accept,contentType=contentType)
             response_body = json.loads(response.get('body').read())
             embedding=response_body['embedding']
-        else:
-            
+        elif "cohere" in param["emb"].lower(): 
+            prompt= {
+                "texts": [chunk],
+             "input_type": "search_document"
+            }
+            body=json.dumps(prompt)
+            modelId = param["emb_model"]
+            accept = "*/*"
+            contentType = 'application/json'
+
+            response = BEDROCK.invoke_model(body=body, modelId=modelId, accept=accept,contentType=contentType)
+            response_body = json.loads(response.get('body').read())
+            embedding=response_body['embeddings'][0]
+        else:            
             payload = {'text_inputs': [chunk]}
             payload = json.dumps(payload).encode('utf-8')
 
@@ -219,7 +282,7 @@ def create_os_index(param, file_location):
             'passage_id': chunk_id,
             'passage': chunk, 
             'embedding': embedding}
-        response = requests.post(f'{URL}/_doc/{i}', auth=HTTPBasicAuth(es_username, es_password), json=document,timeout=120)
+        response = requests.post(f'{URL}/_doc/{i}', auth=HTTPBasicAuth(es_username, es_password), json=document,timeout=120,verify= TLS_CERT_PATH if TLS_CERT_PATH else True)  
         i += 1
         if response.status_code not in [200, 201]:
             logger.error(response.status_code)
@@ -227,16 +290,16 @@ def create_os_index(param, file_location):
             break
     return domain_index
 
-def split_doc(doc_name):    
-    dir_name=doc_name.split('.')[0]
-    inputpdf = PdfReader(open(doc_name, "rb"))
-    Path(dir_name).mkdir(parents=True, exist_ok=True) 
-    for i in range(len(inputpdf.pages)):
-        output = PdfWriter()
-        output.add_page(inputpdf.pages[i])
-        with open(f"{dir_name}/{dir_name}-{i+1}.pdf" ,"wb") as outputStream:
-            output.write(outputStream)    
-    return dir_name
+# def split_doc(doc_name):    
+#     dir_name=doc_name.split('.')[0]
+#     inputpdf = PdfReader(open(doc_name, "rb"))
+#     Path(dir_name).mkdir(parents=True, exist_ok=True) 
+#     for i in range(len(inputpdf.pages)):
+#         output = PdfWriter()
+#         output.add_page(inputpdf.pages[i])
+#         with open(f"{dir_name}/{dir_name}-{i+1}.pdf" ,"wb") as outputStream:
+#             output.write(outputStream)    
+#     return dir_name
 
 def kendra_index(doc_name):
     import time
@@ -317,11 +380,13 @@ def kendra_index(doc_name):
                 time.sleep(2)
             
 def get_chunk_pages(page_dict,chunk):
-    encoding = tiktoken.get_encoding('cl100k_base')
+    """
+    Getting chunk page number of each chunk to use as metadata
+    """
     token_dict={}
     length=0
-    for pages in page_dict.keys():  
-        length+=len(encoding.encode(page_dict[pages]))
+    for pages in page_dict.keys():         
+        length+=len(page_dict[pages].split())       
         token_dict[pages]=length
     chunk_page={}
     cumm_chunk=chunk
@@ -348,52 +413,115 @@ def get_chunk_pages(page_dict,chunk):
                 cumm_chunk+=chunk
     return chunk_page
 
-def chunker(file_name, chunk_size, file):
+def chunker(chunk_size, file):
+    """
+    Chunking by number of words, rule of thumb (1 token is ~3/5th a word).
+    I did not clean punctuation marks or do any text cleaning.
+    """
     chunk_size=round(chunk_size)
-    encoding = tiktoken.get_encoding('cl100k_base')
-    # file_name=file_name
-    doc_id=file_name.split('/')[-1]
-    text=' '.join(file.values())
-    tokens = encoding.encode(text)
-    n_docs = 1
-    if not os.path.exists(file_name):
-      # Directory does not exist, create it
-      os.makedirs(file_name)
-    chunk_pages=get_chunk_pages(file,chunk_size)
-    for i in range(0, len(tokens), chunk_size): 
-        #print(i)
-        chunk_tokens = tokens[i: i+chunk_size]   
-        chunk = encoding.decode(chunk_tokens)
-        with open(f'{file_name}/{doc_id}_{chunk_pages[(int(i)//chunk_size)+1]}', 'w') as f:
-            f.write(chunk)
+    result={}      
+    text=' '.join(file.values())    
+    words=text.split()
+    n_docs = 1    
+    chunk_pages=get_chunk_pages(file,chunk_size) # get page number for each chunk to use as metadata
+    for i in range(0, len(words), chunk_size): # iterate through doc and create chunks not exceeding chunk size       
+        chunk_words = words[i: i+chunk_size]   
+        chunk = ' '.join(chunk_words)
+        if chunk_pages[(int(i)//chunk_size)+1] in result.keys():
+            result[f"{chunk_pages[(int(i)//chunk_size)+1]}*{str(time.time()).split('.')[-1]}"]=chunk
+        else:
+            result[chunk_pages[(int(i)//chunk_size)+1]]=chunk
         n_docs += 1    
-    st.write(file_name)
-    return file_name
-
-def extract_text_single1(file):  
-    bucket=file.split('/',4)[3]
-    key=file.split('/',4)[-1]
-    response = TEXTRACT.detect_document_text(
-        Document={      
-            'S3Object': {
-            'Bucket': bucket,
-            'Name': key,         
-        }
-        }
-    )
-    blocks = response['Blocks']   
-
-    bbox=[]
-    word=[]
-    for item in response['Blocks']:
-        if item["BlockType"] == "WORD"  :
-            bbox.append(item['Geometry']['BoundingBox'])
-            word.append(item["Text"])    
-
-    result=" ".join([x for x in word])
     return result
 
-def doc_qna_endpoint(endpoint, responses,prompt,params):
+def full_doc_extraction(file):    
+    link=file.split('###')[0]
+    if "pdf" in os.path.splitext(link)[-1]:
+        files=file.split('###')
+        bucket=files[0].split('/',4)[3]
+        key=files[0].split('/',4)[-1]
+        
+        ## Read pdf file in memory
+        s3 = boto3.resource('s3')
+        obj = s3.Object(bucket, key)
+        pdf_bytes=obj.get()['Body']
+        
+        ## open pdf file 
+        with io.BytesIO(pdf_bytes.read()) as open_pdf_file:   
+            doc = fitz.open(stream=open_pdf_file)  
+        if doc.page_count>1:    
+            ## Extract the page from pdf file and send to textract
+            page = doc.load_page(int(files[-1]))  
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) 
+            response = TEXTRACT.detect_document_text(
+            Document={      
+                 'Bytes': pix.tobytes("png", 100),
+                }
+            )
+            blocks = response['Blocks']   
+
+            bbox=[]
+            word=[]
+            for item in response['Blocks']:
+                if item["BlockType"] == "WORD"  :
+                    # bbox.append(item['Geometry']['BoundingBox'])
+                    word.append(item["Text"])    
+
+            result=" ".join([x for x in word])
+        else:
+            ## pdf has one page, send to textract
+            response = TEXTRACT.detect_document_text(
+            Document={      
+                'S3Object': {
+                'Bucket': bucket,
+                'Name': key,         
+                }
+                }
+            )
+            blocks = response['Blocks']   
+
+            bbox=[]
+            word=[]
+            for item in response['Blocks']:
+                if item["BlockType"] == "WORD"  :
+                    # bbox.append(item['Geometry']['BoundingBox'])
+                    word.append(item["Text"])    
+
+            result=" ".join([x for x in word])           
+    
+    elif "txt" in os.path.splitext(link)[-1]:
+        files=file.split('###')
+        bucket=files[0].split('/',4)[3]
+        key=files[0].split('/',4)[-1]
+        
+        ## Read pdf file in memory
+        s3 = boto3.resource('s3')
+        obj = s3.Object(bucket, key)
+        result=obj.get()['Body'].read().decode()
+        
+        
+    elif "html" in os.path.splitext(link)[-1]:
+        files=file.split('###')
+        bucket=files[0].split('/',4)[3]
+        key=files[0].split('/',4)[-1]
+
+        ## Read pdf file in memory
+        s3 = boto3.resource('s3')
+        obj = s3.Object(bucket, key)
+        html=obj.get()['Body'].read().decode()  
+        
+        part1=html.split('<head>')
+        part2=part1[-1].split('</head>')
+        result=part1[0]+part2[1]
+      
+    elif "xml" in os.path.splitext(link)[-1]:
+        pass
+    elif "csv" in os.path.splitext(link)[-1]:
+        pass
+    
+    return result
+
+def doc_qna_endpoint(endpoint, responses,prompt,params, handler=None):
     models=["claude","llama","cohere","ai21","titan"]
     chosen_model=[x for x in models if x in params['model_name'].lower()][0]
     total_response=[]   
@@ -401,11 +529,11 @@ def doc_qna_endpoint(endpoint, responses,prompt,params):
     persona_dict={"General":"assistant","Finance":"finanacial analyst","Insurance":"insurance analyst","Medical":"medical expert"}
     
     if "Kendra" in params["rag"]:
-        if 'multiple-passages' in params['method']:
+        if 'combined-passages' in params['method']:
             score = ", ".join([x['ScoreAttributes']["ScoreConfidence"]   for x in responses['ResultItems'][:round(params['K'])]]) 
             doc_link = [x['DocumentURI'] for x in responses['ResultItems'][:round(params['K'])]]
-            page_no = ", ".join([x.split('/')[-1].split('-')[-1].split('.')[0] for x in doc_link])      
-            
+            # page_no=", ".join([str(x['DocumentAttributes'][1]['Value']['LongValue']) for x in responses['ResultItems'][:round(params['K'])]])   
+            page_no = ", ".join([x.split('/')[-1].split('-')[-1].split('.')[0] for x in doc_link])  
             holder={}
             for x,y in enumerate(responses['ResultItems'][:round(params['K'])]):
                 holder[x]={"document":y["Content"], "source":y['DocumentURI']}  
@@ -415,22 +543,30 @@ def doc_qna_endpoint(endpoint, responses,prompt,params):
             qa_prompt =prompt_template.format(doc=holder, prompt=prompt, role=persona_dict[params['persona']])
             if "claude" in params['model_name'].lower():
                 qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"              
-            answer, in_token, out_token=query_endpoint(params, qa_prompt)
+            answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
             answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
             total_response.append(answer1)
             return total_response
-        elif 'multiple-full-pages' in params['method']:            
+        elif 'full-pages' in params['method']:            
             score = ", ".join([x['ScoreAttributes']["ScoreConfidence"]   for x in responses['ResultItems'][:round(params['K'])]]) 
             doc_link = [x['DocumentURI'] for x in responses['ResultItems'][:round(params['K'])]]
-            page_no = ", ".join([x.split('/')[-1].split('-')[-1].split('.')[0] for x in doc_link])  
-            holder={}
-            for x,y in enumerate(responses['ResultItems']):
-                holder[x]={"document":y["Content"], "source":y['DocumentURI']}
-            sources=[x['source'] for x in list(holder.values())[:round(params['K'])]]
+            # page_no = ", ".join([x.split('/')[-1].split('-')[-1].split('.')[0] for x in doc_link])  
+            page_no=[str(x['DocumentAttributes'][1]['Value']['LongValue']) for x in responses['ResultItems'][:round(params['K'])]]
+            holder={}           
+            
+            from itertools import zip_longest
+            sources = []
+            # Use zip_longest to handle uneven lengths
+            for item1, item2 in zip_longest(doc_link, page_no, fillvalue=''):
+                sources.append('###'.join([str(item1), str(item2)]))
+                
+            page_no=", ".join(page_no)
+            
+            
             import multiprocessing    
             num_concurrent_invocations = len(sources)
             pool = multiprocessing.Pool(processes=num_concurrent_invocations)            
-            context=pool.map(extract_text_single1, sources)
+            context=pool.map(full_doc_extraction, sources)
             pool.close()
             pool.join() 
             
@@ -440,7 +576,7 @@ def doc_qna_endpoint(endpoint, responses,prompt,params):
             if "claude" in params['model_name'].lower():
                 qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
             
-            answer, in_token, out_token=query_endpoint(params, qa_prompt)
+            answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
             answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
             total_response.append(answer1)
             return total_response
@@ -453,58 +589,55 @@ def doc_qna_endpoint(endpoint, responses,prompt,params):
                 score = responses['ResultItems'][x]['ScoreAttributes']["ScoreConfidence"]              
                 passage = responses['ResultItems'][x]['Content']
                 doc_link = responses['ResultItems'][x]['DocumentURI']
-                page_no = responses['ResultItems'][x]['DocumentURI'].split('/')[-1].split('-')[-1].split('.')[0]
+                page_no=responses['ResultItems'][x]['DocumentAttributes'][1]['Value']['LongValue']
                 s3_uri=responses['ResultItems'][x]['DocumentId']
                     
                 qa_prompt =prompt_template.format(doc=passage, prompt=prompt, role=persona_dict[params['persona']])
                 if "claude" in params['model_name'].lower():
                     qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
                 
-                answer, in_token, out_token=query_endpoint(params, qa_prompt)
+                answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
          
                 answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
                 total_response.append(answer1)
             return total_response
         #passage=get_text_link(s3_uri)
     elif "OpenSearch" in params["rag"]:
-        if 'single-passages' in params['method']: 
+        if 'single-passages'  in params['method']: 
             with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1_1.txt","r") as f:
                     prompt_template=f.read()
             for response in responses:            
                 score = response['_score']
                 passage = response['_source']['passage']
                 doc_link = f"https://{BUCKET}.s3.amazonaws.com/file_store/{response['_source']['doc_id']}"
-                page_no = response['_source']['passage_id']
-                
-                #https://fairstone.s3.amazonaws.com/docqna/amzn-20221231/amzn-20221231-1.pdf      
+                page_no = response['_source']['passage_id']   
                 qa_prompt =prompt_template.format(doc=passage, prompt=prompt, role=persona_dict[params['persona']])
                 if "claude" in params['model_name'].lower():
                     qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
-                answer, in_token, out_token=query_endpoint(params, qa_prompt)
+                answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
                 answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no,"Input Token":in_token,"Output Token":out_token}
                 total_response.append(answer1)
-                st.write(total_response)
             return total_response
-        elif 'multiple-passages' in params['method']:
+        elif 'combined-passages' or 'full-pages' in params['method']:
             with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
                     prompt_template=f.read()
 
             score = ",".join([str(x['_score']) for x in responses])
             passage = [x['_source']['passage'] for x in responses]
             doc_link = f"https://{BUCKET}.s3.amazonaws.com/file_store/{responses[0]['_source']['doc_id']}"
-            page_no = ",".join([x['_source']['passage_id'] for x in responses])
-            #https://fairstone.s3.amazonaws.com/docqna/amzn-20221231/amzn-20221231-1.pdf      
+            page_no = ",".join([x['_source']['passage_id'] for x in responses])           
             qa_prompt =prompt_template.format(doc=passage, prompt=prompt, role=persona_dict[params['persona']])
             if "claude" in params['model_name'].lower():
                 qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
-            answer, in_token, out_token=query_endpoint(params, qa_prompt)
+            answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
             answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no,"Input Token":in_token,"Output Token":out_token}
             total_response.append(answer1)
             return total_response
           
             
             
-def query_endpoint(params, qa_prompt):
+def query_endpoint(params, qa_prompt, handler=None):
+    
     if 'ai21' in params['model_name'].lower():
 
         import json        
@@ -529,22 +662,16 @@ def query_endpoint(params, qa_prompt):
         st.session_state['token']+=tokens
 
     elif 'claude' in params['model_name'].lower():
-        import json 
+        inference_modifier = { "max_tokens_to_sample": round(params['max_len']),
+                              "temperature": params['temp'], 
+                                # "top_k": 50,
+                                # "top_p": params['top_p'],  
+                                 # "stop_sequences": []        
+                                         }      
         qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"
-        prompt={
-          "prompt": qa_prompt,
-          "max_tokens_to_sample": round(params['max_len']),
-          "temperature": params['temp'],
-          # "top_k": 50,
-          # "top_p": params['top_p'],  
-        }
-        prompt=json.dumps(prompt)
-        response = BEDROCK.invoke_model(body=prompt,
-                                modelId=params['endpoint-llm'],  
-                                accept="application/json", 
-                                contentType="application/json")
-        answer=response['body'].read().decode()
-        answer=json.loads(answer)['completion']
+        prompt=qa_prompt
+        llm = Bedrock(model_id=params['endpoint-llm'],  client=BEDROCK, model_kwargs = inference_modifier,streaming=True if handler else False,   callbacks=handler)        
+        answer=llm.invoke(prompt)       
         claude = Anthropic()
         input_token=claude.count_tokens(qa_prompt)
         output_token=claude.count_tokens(answer)
@@ -578,19 +705,14 @@ def query_endpoint(params, qa_prompt):
     elif 'cohere' in params['model_name'].lower():         
         
         import json 
-        prompt={
-          "prompt": qa_prompt,
-          "max_tokens": round(params['max_len']), 
-            "temperature": params['temp'],
-             "return_likelihoods": "GENERATION"   
-        }
-        prompt=json.dumps(prompt)
-        response = BEDROCK.invoke_model(body=prompt,
-                                modelId=params['endpoint-llm'], 
-                                accept="application/json", 
-                                contentType="application/json")
-        answer=response['body'].read().decode()
-        answer=json.loads(answer)["generations"][0]['text']
+        inference_modifier = { 
+                    "max_tokens": round(params['max_len']), 
+                     "temperature": params['temp'], 
+                    "return_likelihoods": "GENERATION"   
+                     }  
+        prompt=qa_prompt
+        llm = Bedrock(model_id=params['endpoint-llm'],  client=BEDROCK, model_kwargs = inference_modifier,streaming=True if handler else False,  callbacks=handler) 
+        answer=llm.invoke(prompt)    
         encoding=token_cohere("Cohere/command-nightly")
         input_token=len(encoding.encode(qa_prompt))
         output_token=len(encoding.encode(answer))
@@ -622,68 +744,36 @@ def query_endpoint(params, qa_prompt):
         
 
 def load_document(file_bytes, doc_name, param):
-    try:
-        os.mkdir('file')
-    except:
-        pass
+     
     if "Kendra" in param["rag"]:    
-        with open(doc_name, 'wb') as fp:
-            fp.write(file_bytes)
-        inputpdf = PdfReader(open(doc_name, "rb"))
-        if len(inputpdf.pages)>1:
-            dir_folder=split_doc(doc_name)
-            subprocess.run(["aws", "s3", "sync", dir_folder, f"s3://{BUCKET}/{PREFIX}/{dir_folder}/"])   
-            time.sleep(3)
-            st.write('Kendra Indexing')
-            kendra_index(dir_folder) 
-        elif len(inputpdf.pages)==1:
-            dir_folder=doc_name.split('.')[0]
-            subprocess.run(["aws", "s3", "sync", doc_name, f"s3://{BUCKET}/{PREFIX}/{dir_folder}/"])
-            st.write('Kendra Indexing')
-            kendra_index(dir_folder) 
+       
+        dir_name=os.path.splitext(doc_name)[0]
+        S3.upload_fileobj(file_bytes, BUCKET, f"{PREFIX}/{dir_name}/{doc_name}")
+        time.sleep(1)
+        st.write('Kendra Indexing')
+        kendra_index(dir_name) 
+       
     elif "OpenSearch" in param["rag"]:
-        with open(doc_name, 'wb') as fp:
-            fp.write(file_bytes)
-        inputpdf = PdfReader(open(doc_name, "rb"))
-        if len(inputpdf.pages)>1:
-            text, file_dir=load_documents(file_bytes, doc_name)
-            chunk_path=chunker(file_dir,param["chunk"], text)
-            domain=create_os_index(param, chunk_path)
-            return domain
-        elif len(inputpdf.pages)==1:
-            text, file_dir= load_document_single(file_bytes, doc_name)
-            chunk_path=chunker(file_dir, param["chunk"], text)
-            domain=create_os_index(param, chunk_path)            
-            return domain 
+        s3_path=f"file_store/{doc_name}"
+        file_bytes=file_bytes.read()
+        S3.put_object(Body=file_bytes,Bucket= BUCKET, Key=s3_path)       
+        time.sleep(1)    
+        doc_name=os.path.splitext(doc_name)[0]
+        with io.BytesIO(file_bytes) as open_pdf_file:   
+            doc = fitz.open(stream=open_pdf_file) 
+        if doc.page_count>1:    
+            text= extract_text(BUCKET, s3_path)
+        else:
+            text= extract_text_single(BUCKET, s3_path)
+        chunk=chunker(param["chunk"], text)
+        domain=create_os_index(param, chunk )
         
-def load_documents(file_bytes, doc_name): 
-    try:
-        os.mkdir('file')
-    except:
-        pass
+def load_document_batch_summary(file_bytes, doc_name): 
     s3_path=f"file_store/{doc_name}"
-    with open(f"file/{doc_name}", 'wb') as fp:
-        fp.write(file_bytes)
-   
-    S3.upload_file(doc_name, BUCKET, s3_path)
-    time.sleep(2)
-    
-    text,file_p= extract_text(BUCKET, s3_path)
-    return text,file_p
-
-def load_document_single(file_bytes, doc_name):  
-    try:
-        os.mkdir('file')
-    except:
-        pass
-    s3_path=f"file_store/{doc_name}"
-    with open(f"file/{doc_name}", 'wb') as fp:
-        fp.write(file_bytes)
-   
-    S3.upload_file(doc_name, BUCKET, s3_path)
-    st.write('Extracting Text')
-    text,file_p = extract_text_single(BUCKET, s3_path)
-    return text,file_p
+    S3.put_object(Body=file_bytes,Bucket= BUCKET, Key=s3_path)
+    time.sleep(1)    
+    text= extract_text(BUCKET, s3_path)
+    return text
 
 @st.cache_data
 def extract_text_single(file):  
@@ -719,6 +809,19 @@ def similarity_search(payload, param):
         response = BEDROCK.invoke_model(body=body, modelId=modelId, accept=accept,contentType=contentType)
         response_body = json.loads(response.get('body').read())
         embedding=response_body['embedding']
+    elif "cohere" in param["emb"].lower(): 
+            prompt= {
+                "texts": [payload],
+             "input_type": "search_document"
+            }
+            body=json.dumps(prompt)
+            modelId = param["emb_model"]
+            accept = 'application/json'
+            contentType = 'application/json'
+
+            response = BEDROCK.invoke_model(body=body, modelId=modelId, accept=accept,contentType=contentType)
+            response_body = json.loads(response.get('body').read())
+            embedding=response_body['embeddings'][0]
     else:
 
         payload = {'text_inputs': payload}
@@ -746,7 +849,7 @@ def similarity_search(payload, param):
     es_password = OS_KEY 
     domain_endpoint = OS_ENDPOINT
     URL = f'{domain_endpoint}/{param["domain"]}/_search'     
-    response = requests.post(URL, auth=HTTPBasicAuth(es_username, es_password), json=query, timeout=120)
+    response = requests.post(URL, auth=HTTPBasicAuth(es_username, es_password), json=query, timeout=120,verify= TLS_CERT_PATH if TLS_CERT_PATH else True)  
     response_json = response.json()
     hits = response_json['hits']['hits']    
     return hits
@@ -754,18 +857,15 @@ def similarity_search(payload, param):
 @st.cache_data
 def extract_text(bucket, filepath):   
     st.write('Extracting Text')
-
     response = TEXTRACT.start_document_text_detection(DocumentLocation={'S3Object': {'Bucket':bucket, 'Name':filepath}},JobTag='Employee')
     maxResults = 1000
     paginationToken = None
     finished = False
     jobId=response['JobId']
     print(jobId)
-    total_words=[]
-    file=filepath.split('/')[-1].split('.pdf')[0]
-    word_prefix=f'words/{file}'
+    total_words=[]   
     dict_words={}   
-    total_words=[]
+    
     while finished == False:
         response = None               
         if paginationToken == None:
@@ -807,11 +907,13 @@ def extract_text(bucket, filepath):
         else:
             finished = True
     total_words=" ".join([x for x in total_words])
-    return dict_words, f'{word_prefix}/{file}'
+    return dict_words
 
 #function to summarize initial chunks
 def summarize_section(payload):
-
+    """
+    Initial summary of chunks
+    """
     models=["claude","llama","cohere","ai21","titan"]
     chosen_model=[x for x in models if x in payload['model_name'].lower()][0]
     with open(f"{PARENT_TEMPLATE_PATH}/summary/{chosen_model}/{payload['persona'].lower()}.txt","r") as f:
@@ -823,8 +925,10 @@ def summarize_section(payload):
     response,i_t,o_t= query_endpoint(payload, prompt)
     return response     
   
-def summarize_final(payload):
-    
+def summarize_final(payload, handler=None):
+    """
+    Final summary of of all chunks summary
+    """
     models=["claude","llama","cohere","ai21","titan"]
     chosen_model=[x for x in models if x in payload['model_name'].lower()][0]
     with open(f"{PARENT_TEMPLATE_PATH}/summary/{chosen_model}/{payload['persona'].lower()}.txt","r") as f:
@@ -833,41 +937,45 @@ def summarize_final(payload):
     if "claude" in payload['model_name'].lower():
         prompt=f"\n\nHuman:\n{prompt}\n\nAssistant:"
     payload['prompt'] = prompt  
-    response,i_t,o_t= query_endpoint(payload, prompt)
+    response,i_t,o_t= query_endpoint(payload, prompt, handler)
     return response 
 
 
 #function to split extracted text to chunks
 def split_into_sections(paragraph: str, max_words: int) -> list: 
+    """
+    For Batch document Summarization.
+    Spliting by words, with a buffer of 50.
+    """
+    buffer_len=50
     sections = []
     curr_sect = []    
     # paragraph=' '.join(paragraph.values())
     for word in paragraph.split():
         if len(curr_sect) + 1 <= max_words:
             curr_sect.append(word)        
-        else:
-            if len(sections)<1:
-                sections.append(' '.join(curr_sect))
-                curr_sect = [word]
-            else:
-                buffer=sections[-1].split()[-50:]
-                curr_sect=buffer+curr_sect
-                sections.append(' '.join(curr_sect))
-                curr_sect = [word]
+        else:            
+            sections.append(' '.join(curr_sect))
+            buffer=sections[-1].split()[-buffer_len:]
+            curr_sect = buffer+[word]
     if curr_sect:
-        buffer=sections[-1].split()[-50:]
+        buffer=sections[-1].split()[-buffer_len:]
         curr_sect=buffer+curr_sect
     sections.extend([' '.join(curr_sect) for curr_sect in ([] if not curr_sect else [curr_sect])]) 
     return sections
 
 def first_summ(params, section):
+    """
+    Function to call initial summary of chunks.
+    this function is run in parallel to the number of chunks
+    """
     params['prompt']= section
     summaries = summarize_section(params)    
     return summaries
 
-def sec_chunking(char_length,text): 
+def sec_chunking(word_length,text): 
     sec_partial_summary=[]
-    num_chunks=char_length//10000
+    num_chunks=word_length//3000
     #further chucking of initial summary and summarizing (summary of summary) 
     for i in range(num_chunks): 
         num_summary=len(text.split('##\n\n'))//num_chunks
@@ -882,11 +990,10 @@ def sec_chunking(char_length,text):
 
 def summarize_context(params):
     st.title('Batch Document Summarization') 
-    
-    if st.button('Summarize', type="primary"):
-        
-        text=' '.join(st.session_state['text'].values())
-        # Calculate token size of input text per model and decide chunking
+
+    if st.button('Summarize', type="primary"):        
+        text=' '.join(st.session_state['text'].values())        
+        # Calculate token size of input text per model and decide chunking  
         if "claude" in params['model_name'].lower():
             claude = Anthropic()
             token_length=claude.count_tokens(text)
@@ -900,7 +1007,7 @@ def summarize_context(params):
             token_length=len(encoding.encode(text))
             chunking_needed=token_length>3000
         elif "ai21" in params['model_name'].lower():
-            #replace with AI21 tokenizer, using number of words instead
+            #replace with AI21 tokenizer
             encoding = tiktoken.get_encoding('cl100k_base')
             token_length=len(encoding.encode(text))
             chunking_needed=token_length>6000
@@ -908,24 +1015,26 @@ def summarize_context(params):
             encoding = tiktoken.get_encoding('cl100k_base')
             token_length=len(encoding.encode(text))
             chunking_needed=token_length>6000
-        tic = time.time()
+        tic = time.time()        
+        container_summ=st.empty()
+        stream_handler = StreamHandler(container_summ)
         if chunking_needed:
-            st.write("Chunking documents...")
+            container_summ.write("Chunking documents...")
             params['max_len']=round(params['first_token_length'])
             sections = split_into_sections(text, params['chunk_len'])  
-            num_concurrent_invocations = 10
+            num_concurrent_invocations = 10 #number of parallel calls
             pool = multiprocessing.Pool(processes=num_concurrent_invocations)
             results = pool.starmap(first_summ, [(params, section) for section in sections])
             pool.close()
             pool.join() 
-            text = '##\n\n'.join(results) 
-            char_length=sum([len(x) for x in text]) 
-            if char_length>params['chunk_len']*10: 
-                sec_partial_summary=sec_chunking(char_length,text)
+            text = "\n\n".join(results) 
+            
+            word_length=len(text.split())     
+            if word_length>max(params['chunk_len']*3,3000): # Check if further chunking is need if text is greater than 3000 words
+                sec_partial_summary=sec_chunking(word_length,text)
                 params['max_len']=round(params['first_token_length'])
                 pool = multiprocessing.Pool(processes=num_concurrent_invocations)              
-                final_results = pool.starmap(first_summ, [(params, summ) for summ in sec_partial_summary])    
-                # Close the pool and wait for all processes to finish
+                final_results = pool.starmap(first_summ, [(params, summ) for summ in sec_partial_summary]) 
                 pool.close()
                 pool.join()   
                 #Final summary
@@ -933,34 +1042,38 @@ def summarize_context(params):
                 full_summary="\n\n".join([x for x in final_results])
                 params['prompt']=full_summary
                 params['max_len']=round(params['second_token_length'])
-                summary=summarize_final(params)
+                summary=summarize_final(params,[stream_handler])
             else:
+                ## Final Summary
                 params['prompt']=text
                 params['max_len']=round(params['second_token_length'])
-                summary=summarize_final(params)
+                summary=summarize_final(params,[stream_handler])
         else:
+            ## No Chunking Needed Summary
             params['prompt']=text
             params['max_len']=round(params['second_token_length'])
-            summary=summarize_final(params)
+            summary=summarize_final(params,[stream_handler])
         toc = time.time()
         st.session_state['elapsed'] = round(toc-tic, 1)
-        with open('output.txt','w') as f:
-            for line in summary.split('\n'):
-                f.write(line)
-        # load TXT document
-        doc = aw.Document('output.txt')        
-        # save TXT as PDF file
-        doc.save("txt-2-pdf.pdf", aw.SaveFormat.PDF)
-        #upload to s3 and make public. Do take out the "public-read" from the call if you do not want the file to be public
-        subprocess.run(["aws", "s3", "cp", "txt-2-pdf.pdf", f"s3://{BUCKET}/{PREFIX}/txt-2-pdf.pdf"])
-        summary+=f"\n\n Link to pdf [summary](https://{BUCKET}.s3.amazonaws.com/{PREFIX}/txt-2-pdf.pdf)"
-        st.session_state['summary'] = summary     
+        ## Create pdf of summary text
+        doc = aw.Document()
+        builder = aw.DocumentBuilder(doc) 
+        builder.write(summary)
+        # Save Locally and upload to s3
+        file_name=f"{st.session_state['file_name'].split('.')[0]}_summary.pdf"
+        doc.save(file_name, aw.SaveFormat.PDF)
+        S3.upload_file(file_name, BUCKET, f"Summary/{file_name}")
+        summary+=f"\n\n Link to pdf [summary](https://{BUCKET}.s3.amazonaws.com/Summary/{file_name})"
+        st.session_state['summary'] = summary 
         st.subheader(f'Summary (in {st.session_state["elapsed"]} seconds):')
-        # st.experimental_rerun()
-        st.markdown(st.session_state['summary'].replace("$","USD ").replace("%", " percent"))
+        container_summ.markdown(st.session_state['summary'].replace("$","USD ").replace("%", " percent"))
+     
         
         
-def summarize_sect(param, payload):
+def summarize_sect(param, payload, handler=None):
+    """
+    Summary function for Document Insights Action
+    """
     models=["claude","llama","cohere","ai21","titan"]
     chosen_model=[x for x in models if x in param['model_name'].lower()][0]
     with open(f"{PARENT_TEMPLATE_PATH}/summary/{chosen_model}/{param['persona'].lower()}.txt","r") as f:
@@ -970,10 +1083,28 @@ def summarize_sect(param, payload):
         prompt=f"\n\nHuman:\n{prompt}\n\nAssistant:" 
   
     param['prompt'] = prompt
-    response = query_endpoint(param, prompt)
+    response = query_endpoint(param, prompt, handler)
     return response  
 
+def extract_entities(text, entities):
+    extracted_data = {}
+
+    for entity in entities:
+        entity_type = entity['Type']
+        begin_offset = entity['BeginOffset']
+        end_offset = entity['EndOffset']
+
+        if entity_type not in extracted_data:
+            extracted_data[entity_type] = []
+
+        extracted_data[entity_type].append(text[begin_offset:end_offset])
+
+    return extracted_data
+
 def page_summary(pdf_file,params):
+    """
+    This action takes the entire rendered document page as context for the following LLM actions below.
+    """
     # Page navigation buttons
     pdf_file=pdf_file.read()
     if pdf_file:
@@ -983,47 +1114,65 @@ def page_summary(pdf_file,params):
         colm1,colm2=st.columns([1,1])
         with colm1:
             col1, col2, col3 = st.columns(3)
+            # Buttons
             if col1.button("Previous Page", key="prev_page"):
-                st.session_state.current_page-=1        
+                st.session_state.page_slider-=1        
                 st.session_state['page_summ']=""
             if col3.button("Next Page", key="next_page"):
-                st.session_state.current_page+=1
+                st.session_state.page_slider+=1
                 st.session_state['page_summ']=""
             # Page slider
-            if col2.slider("Page Slider", min_value=0, max_value=page_count-1, value=st.session_state.current_page, key="page_slider"):
-                st.session_state.current_page= st.session_state.page_slider
-                st.session_state['page_summ']=""
-
-            page = pdf_document.load_page(st.session_state.current_page)
+            if col2.slider("Page Slider", min_value=0, max_value=page_count-1, key="page_slider"): 
+                st.session_state['page_summ']=""              
+            # Rendering pdf page
+            page = pdf_document.load_page(st.session_state.page_slider)
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img = Image.open(io.BytesIO(pix.tobytes("png", 100))) 
             st.image(img)
-        with colm2:
-            tab1, tab2, tab3 = st.tabs(["**Textract**", "**Page Summary**", "**Page QnA**"])
+        with colm2:            
+            tab1, tab2, tab3 = st.tabs(["**Entity Extraction**", "**Page Summary**", "**Page QnA**"])
             with tab1:
-                if st.button('Extract Text', type="primary", key='texterd'): 
+                c1,c2=st.columns(2)
+                ## Uses Amazon Comprehend to detect Entities and PII in the current doc page
+                if c1.button('Extract Entities', type="primary", key='entities'): 
                     image_b=pix.tobytes("png", 100)
-                    text, bbox=extract_text_single(image_b)
-                    text=text.split(' ')
+                    text, bbox=extract_text_single(image_b)           
+                    response = COMPREHEND.detect_entities(
+                        Text=text,
+                        LanguageCode='en',                        
+                    )
                     text_container = st.container()
-
+                    entities=[x['Text'] for x in response['Entities']]
                     with text_container:
-                        cl1,cl2,cl3,cl4,cl5=st.columns(5)
-                        column=[cl1,cl2,cl3,cl4,cl5]#,cl6,cl7,cl8,cl9]
-                        for x,y in enumerate(text):
+                        cl1,cl2,cl3=st.columns(3)
+                        column=[cl1,cl2,cl3]#,cl6,cl7,cl8,cl9]
+                        for x,y in enumerate(entities):
                             index = x%len(column)                        
                             column[index].button(y, key=str(uuid.uuid4()),use_container_width=True)
-
-
-            with tab2:
-                if st.button('Summarize',key='summ'):               
+                            
+                if c2.button('Extract PII Entities', type="primary", key='texterd'): 
                     image_b=pix.tobytes("png", 100)
                     text, bbox=extract_text_single(image_b)
-                    summary, input_tok, output_tok=summarize_sect(params, text)                
+                    entities=COMPREHEND.detect_pii_entities(
+                        Text=text,
+                        LanguageCode='en'
+                    )
+                    pii=extract_entities(text, entities['Entities'])
+                    st.write(pii)
+
+            with tab2:      
+                ## Summarize current doc page
+                container_tab=st.empty()
+                if st.button('Summarize',type="primary",key='summ'):                     
+                    stream_handler = StreamHandler(container_tab)
+                    image_b=pix.tobytes("png", 100)
+                    text, bbox=extract_text_single(image_b)
+                    summary, input_tok, output_tok=summarize_sect(params, text, [stream_handler])                
                     st.session_state['page_summ']=summary
-                st.markdown(st.session_state['page_summ'].replace("$","USD ").replace("%", " percent"))
+                container_tab.markdown(st.session_state['page_summ'].replace("$","USD ").replace("%", " percent"))
 
             with tab3:
+                ## Chat with the current doc page
                 response_container = st.container()
                 container = st.container()
                 image_b=pix.tobytes("png", 100)
@@ -1074,56 +1223,52 @@ def action_doc(params):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-            
-        if round(params["K"])>1 and params['method']=="single-passages":# and "opensearch" in params["rag"].lower():
+
+        if round(params["K"])>1 and params['method']=="single-passages":
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
+                stream_handler = StreamHandler(message_placeholder)
                 if "Kendra" in params["rag"]:
                     response=query_index(prompt)  
                 elif "OpenSearch" in params["rag"]:            
                     response=similarity_search(prompt, params)                
-                output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params)
+                output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params,[stream_handler])
                 message_placeholder.markdown(output_answer[0]['Answer'].replace("$","USD ").replace("%", " percent"))
                 with st.expander(label="**Metadata**"):             
                     steps=f"""
-                    - Source: [1]({output_answer[0]['Link']})
-                    - Page: {output_answer[0]['Page']} 
-                    - Confidence: {output_answer[0]['Score']}  
-                    - Input Token: {output_answer[0]['Input Token']}
-                    - Output Token: {output_answer[0]['Output Token']}
-                    """   
+- **Source:** [1]({output_answer[0]['Link']})
+- **Page:** {output_answer[0]['Page']} 
+- **Confidence:** {output_answer[0]['Score']}  
+- **Input Token:** {output_answer[0]['Input Token']}
+- **Output Token:** {output_answer[0]['Output Token']}
+- **Model:** {params['model_name']}
+"""   
                     st.markdown(steps)            
             
             st.session_state.messages.append({"role": "assistant", "content": output_answer[0]['Answer'], "steps":steps})
-            with st.expander(label="**Additional Response**"):
-                # try:
-      
+            with st.expander(label="**Additional Response**"):     
                 for k in range(1, round(params["K"])):
                     steps=f"""
-                    - **Answer {k+1}**: {output_answer[k]['Answer'].replace("$","USD ").replace("%", " percent")}
-                    - **Source:** [{k+1}]({output_answer[k]['Link']})
-                    - **Page:** {output_answer[k]['Page']} 
-                    - **Confidence:** {output_answer[k]['Score']}
-                    - **Input Token:** {output_answer[0]['Input Token']}
-                    - **Output Token:** {output_answer[0]['Output Token']}
-                    """  
+- **Answer {k+1}**: {output_answer[k]['Answer'].replace("$","USD ").replace("%", " percent")}
+- **Source:** [{k+1}]({output_answer[k]['Link']})
+- **Page:** {output_answer[k]['Page']} 
+- **Confidence:** {output_answer[k]['Score']}
+- **Input Token:** {output_answer[0]['Input Token']}
+- **Output Token:** {output_answer[0]['Output Token']}
+- **Model:** {params['model_name']}
+"""  
                     st.markdown(steps)            
                     st.session_state.messages.append({"step": steps})
-            # st.rerun()
-                   
-                # except:
-                #     pass
-            
-            
         else:    
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
+                stream_handler = StreamHandler(message_placeholder)
                 if "Kendra" in params["rag"]:
                     response=query_index(prompt)  
                 elif "OpenSearch" in params["rag"]:            
                     response=similarity_search(prompt, params)   
 
-                output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params)
+                output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params,[stream_handler])
                 message_placeholder.markdown(output_answer[0]['Answer'].replace("$","USD ").replace("%", " percent"))
                 if 'single-passages' in params['method']:
                     links= f"[1]({output_answer[0]['Link']})"
@@ -1140,23 +1285,22 @@ def action_doc(params):
                 
                 with st.expander(label="**Metadata**"):             
                     steps=f"""
-                    - Source: {links}
-                    - Page: {output_answer[0]['Page']} 
-                    - Confidence: {output_answer[0]['Score']}
-                    - Input Token: {output_answer[0]['Input Token']}
-                    - Output Token: {output_answer[0]['Output Token']}
-                    """   
+- **Source:** {links}
+- **Page:** {output_answer[0]['Page']} 
+- **Confidence:** {output_answer[0]['Score']}
+- **Input Token:** {output_answer[0]['Input Token']}
+- **Output Token:** {output_answer[0]['Output Token']}
+- **Model:** {params['model_name']}
+"""   
                     st.markdown(steps)            
                 st.session_state.messages.append({"role": "assistant", "content": output_answer[0]['Answer'], "steps":steps})
-                # st.rerun()
 
 
 def app_sidebar():
-    with st.sidebar:
-        st.text_input('Total Token Used', str(st.session_state['token']))
-        st.write('## How to use:')
-        description = """Welcome to our LLM tool extraction and query answering application."""
+    with st.sidebar:               
+        description = """### AI tool powered by suite of AWS services"""
         st.write(description)
+        st.text_input('Total Token Used', str(st.session_state['token'])) 
         st.write('---')
         st.write('### User Preference')
         filepath=None
@@ -1165,7 +1309,7 @@ def app_sidebar():
         persona = st.selectbox('Select Persona', ["General","Finance","Insurance","Medical"])
         action_name = st.selectbox('Choose Activity', options=['Document Query', 'Document Insights','Batch Document Summary'])
         llm_model_name = st.selectbox('Select LL Model', options=MODELS_LLM.keys())
-        
+        st.session_state['action_name']=action_name
         
         if 'Batch Document Summary' in action_name:           
             top_p = st.slider('Top p', min_value=0., max_value=1., value=1., step=.01)
@@ -1180,7 +1324,7 @@ def app_sidebar():
                 file_name=str(file.name)
                 st.session_state['file_name']=file_name
                 st.session_state.generated.append(1) 
-                text, file_dir=load_documents(file.read(), file_name)
+                text=load_document_batch_summary(file.read(), file_name)
                 st.session_state['text'] =text
                 
         if 'Document Insights' in action_name:           
@@ -1198,9 +1342,9 @@ def app_sidebar():
             
 
         elif 'Document Query' in action_name: 
-            methods=st.selectbox('retrieval technique', ["single-passages",'multiple-passages','multiple-full-pages'])
+            methods=st.selectbox('retrieval technique', ["single-passages",'combined-passages','full-pages'])
             st.session_state['rtv']=methods
-            max_len = st.slider('Max Length', min_value=50, max_value=2000, value=150, step=10)
+            max_len = st.slider('Output Length', min_value=50, max_value=2000, value=150, step=10)
             top_p = st.slider('Top p', min_value=0., max_value=1., value=1., step=.01)
             temp = st.slider('Temperature', min_value=0., max_value=1., value=0.01, step=.01)
             
@@ -1214,7 +1358,7 @@ def app_sidebar():
                 m=st.slider('Neighbouring Points', min_value=16.0, max_value=124.0, value=72.0, step=1., help="Explored neighbors count")
                 ef_search=st.slider('efSearch', min_value=10.0, max_value=2000.0, value=1000.0, step=10., help="Exploration Factor")
                 ef_construction=st.slider('efConstruction', min_value=100.0, max_value=2000.0, value=1000.0, step=10., help="Explain Factor Construction")            
-                chunk=st.slider('Token Chunk size', min_value=100.0, max_value=5000.0, value=1000.0, step=100.,help="Token size to chunk documents into Vector DB") 
+                chunk=st.slider('Word Chunk size', min_value=50, max_value=5000 if "titan" in embedding_model.lower() else 300, value=1000 if "titan" in embedding_model.lower() else 300, step=50,help="Word size to chunk documents into Vector DB") 
                 st.session_state['domain']=EMB_MODEL_DOMAIN_NAME[embedding_model.lower()]
                 
                 params = {'action_name':action_name, 'endpoint-llm':MODELS_LLM[llm_model_name],'max_len':max_len, 'top_p':top_p, 'temp':temp, 
@@ -1231,7 +1375,7 @@ def app_sidebar():
                 file_name=str(file.name)
                 st.session_state['file_name']=file_name
                 st.session_state.generated.append(1)
-                domain=load_document(file.read(), file_name,params) 
+                domain=load_document(file, file_name,params) 
       
         return params, file
 

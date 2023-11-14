@@ -13,3 +13,4 @@ streamlit_chat
 pymupdf
 tokenizers
 transformers
+langchain
