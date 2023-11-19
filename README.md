@@ -1,4 +1,4 @@
-# LLM-App
+## My Project
 
 This project walks you through how yoou can deploy a ChatBot that uses the Retrieval Augmented Generation (RAG) Technique. This ChatBot is Powered by [Amazon Bedrock](https://aws.amazon.com/bedrock/)/[Amazon SageMaker JumStart](https://aws.amazon.com/sagemaker/jumpstart/) LLM/Embedding Models and uses [Amazon Kendra](https://aws.amazon.com/kendra/) and/or [Amazon OpenSearch](https://aws.amazon.com/opensearch-service/) as Vector Storage and Retrieval Engines.
 
@@ -72,9 +72,10 @@ This application has three tools:
 - **DocumentQuery**: This uses the Retrieval Augmented Generation (RAG) apparoach with different retrievers (OpenSearch and Kendra) and lets you select different configurations. The user can upload a pdf and get it indexed in either OpenSearch or Kendra.
 
     When using Kendra as retriever for relevant passages:
-    <img src="images/kendra.png"/>
+    <img src="images/kendra-update.png"/>
     
     1. User makes a query with the frontend StreamLit app.
+       i. If Chat history is enabled, previous conversation history is retrieved from DynamoDB. The user query and chat history is sent to the Large Language model (LLM) to determine if the user query is a follow-up from and refers to a previous conversation. If so, the LLM would reformat the query as an independent query (eg. "How much does it cost?" in referral to a previous conversation on a flight from TX to NYC would be reformatted to "How much does a flight from TX to NYC cost?") and then passes the reformatted query to the Amazon Kendra for semantic search. If the user query does not refer to a previous chat history, the original question is sent back to Amazon Kendra for semantic search. To curb latency for this extra LLM call, I set the max response token to ~50-70. Chat history is optional and can be toggled on and off. 
     2. Kendra searches for relevant passages to the user query against its index available data sources.  
     3. The relevant passage is sent together with the user query as a prompt template to the Large Language Model (LLM).
     4. The LLM provides a response to the user query based off the passage provided as context.
@@ -83,9 +84,10 @@ This application has three tools:
     7. kendra crawls and indexes the document.
     
     When using opensearch as retriever for relevant passages:
-    <img src="images/os.png"/>
+    <img src="images/os-update.png"/>
     
     1. User makes a query with the frontend StreamLit app.
+        i. If Chat history is enabled, previous conversation history is retrieved from DynamoDB. The user query and chat history is sent to the Large Language model (LLM) to determine if the user query is a follow-up from and refers to a previous conversation. If so, the LLM would reformat the query as an independent query (eg. "How much does it cost?" in referral to a previous conversation on a flight from TX to NYC would be reformatted to "How much does a flight from TX to NYC cost?") and then passes the reformatted query to the embedding model to generate embeddings. If the user query does not refer to a previous chat history, the original question is sent back to the embedding model to generate embeddings. To curb latency for this extra LLM call, I set the max response token to ~50-70. Chat history is optional and can be toggled on and off. 
     2. An embedding model in Bedrock or SageMaker Endpoint generates embeddings of the query.
     3. OpenSearch search algorithm does a similarity search for relevant passages.
     4. The relevant passage is sent together with the user query as a prompt template to the Large Language Model (LLM).
@@ -110,6 +112,12 @@ This application has three tools:
     
     3. Full-Pages  
         This tecnique depends on your OpenSearch indexing process (Kendra provides metadata for all its responses). Here the retrival is used to get relevant passages. However, a logic is used to extract the metadata of this passages. This metadata could be s3 location of document (for document store in s3), page number of documents, eg. pdf documents, url links of sites etc. Taking a pdf file as an example, this approach takes the file s3 uri path and the page number of the pdf where the passage was gotten from. The pdf document is read into memeory from s3 and the passage page is extracted and sent to Textract to get the page text content. If topK is greater than 1, each page context are combined to a single docuemnt and then sent to the LLM together with the user query. This same approach aaplies to json, xml, csv, site links (instead of s3, a python api is used to load the site in memory) etc for all top k selected response from the retireval. This techniques offers most context to the LLM and defers to the LLM to figure out the answer from the context. This technique would increase the input token size greatly and would be more costly and latency prone than the two previous technique. However, tends to provide more accurate responses from the LLM as they have more than enough context to answer the questions.   
+        
+However, implementing the above techniques is very manual and may not be the efficient way of doing things. I created a logic to automatically implement the retrieval techniques discussed above. The **Auto Retrieval Technique Selector** automates the selection of the right technique for an efficient implementation. This can be enabled in the UI.
+
+<img src="images/auto-rtv-tch.png"/>
+
+Once a user makes a query, a single response (TopK=1) is retrieved from the Retrieval tool and passed to a `Decision Maker` LLM to determine if the retrieved passage is sufficient to answer the user query. If the single retrieved passage is sufficient to answer the query, the passage and the query are sent to the final LLM to generate a response for the user. However, if the single passage is insufficient, one of `Full-page or Combined passage` (for this app I implemented `Full-page` technique by default, but this can always be changed to any other fall back retrieval technique) technique is selected with a TopK=3. The corresponding retrieved passages are combined to a single context in addition to the user query and passed to the final LLM to generate a response.
     
    
 - **Document Insights**: This is a more interactive appraoch where the user uploads a document and can interact with each page of that documnet in real time. Things like QnA, Summarization etc. Here the entire rendered page is passed as context to the LLM. No retrival is used in this approach, the user can only interact with a page at a time.
