@@ -42,8 +42,6 @@ MODELS_EMB = {d['name']: d['endpoint'] for d in APP_MD['models-emb']}
 REGION    = APP_MD['region']
 BUCKET    = APP_MD['Kendra']['bucket']
 PREFIX    = APP_MD['Kendra']['prefix']
-# OS_KEY = APP_MD['opensearch']['es_password']
-# OS_USERNAME =  APP_MD['opensearch']['es_username']
 OS_ENDPOINT  =  APP_MD['opensearch']['domain_endpoint']
 KENDRA_ID = APP_MD['Kendra']['index']
 KENDRA_ROLE=APP_MD['Kendra']['role']
@@ -52,7 +50,14 @@ KENDRA_S3_DATA_SOURCE_NAME=APP_MD['Kendra']['s3_data_source_name']
 HEIGHT=500 # Height of Streamlit container for output text
 TLS_CERT_PATH = APP_MD['tls_cert_path']
 SECRETS_NAME=APP_MD['secrets']
+try:
+    DYNAMODB_TABLE=APP_MD['dynamodb_table']
+    DYNAMODB_USER=APP_MD['dynamodb_user']
+except:
+    DYNAMODB_TABLE=""
+    
 
+DYNAMODB      = boto3.resource('dynamodb')
 S3            = boto3.client('s3', region_name=REGION)
 TEXTRACT      = boto3.client('textract', region_name=REGION)
 KENDRA        = boto3.client('kendra', region_name=REGION)
@@ -60,6 +65,7 @@ SAGEMAKER     = boto3.client('sagemaker-runtime', region_name=REGION)
 BEDROCK = boto3.client(service_name='bedrock-runtime',region_name='us-east-1') 
 COMPREHEND=boto3.client("comprehend")
 
+# Vector dimension mappings of each embedding model
 EMB_MODEL_DICT={"titan":1536,
                 "minilmv2":384,
                 "bgelarge":1024,
@@ -69,6 +75,8 @@ EMB_MODEL_DICT={"titan":1536,
                "gptj6b":4096,
                 "cohere":1024}
 
+# Creating unique domain names for each embedding model using the domain name prefix set in the config json file
+# and a corresponding suffix of the embedding model name
 EMB_MODEL_DOMAIN_NAME={"titan":f"{APP_MD['opensearch']['domain_name']}_titan",
                 "minilmv2":f"{APP_MD['opensearch']['domain_name']}_minilm",
                 "bgelarge":f"{APP_MD['opensearch']['domain_name']}_bgelarge",
@@ -79,6 +87,7 @@ EMB_MODEL_DOMAIN_NAME={"titan":f"{APP_MD['opensearch']['domain_name']}_titan",
                        "cohere":f"{APP_MD['opensearch']['domain_name']}_cohere"}
 
 
+# Enable streaming on Streamlit using Langchain callback handler
 class StreamHandler(BaseCallbackHandler):
     def __init__(self, container, initial_text=""):
         self.container = container
@@ -97,7 +106,7 @@ class StreamHandler(BaseCallbackHandler):
                             scrolling=True,
                         )
 
-
+# Session state keys
 if 'generate' not in st.session_state:
     st.session_state['generate'] = []
 if 'generated' not in st.session_state:
@@ -128,8 +137,20 @@ if 'page_summ' not in st.session_state:
     st.session_state['page_summ'] = ''
 if 'action_name' not in st.session_state:
     st.session_state['action_name'] = ""
+if 'chat_memory' not in st.session_state:
+    if DYNAMODB_TABLE:
+        chat_histories = DYNAMODB.Table(DYNAMODB_TABLE).get_item(Key={"UserId": DYNAMODB_USER})
+        if "Item" in chat_histories:
+            st.session_state['chat_memory']=chat_histories['Item']['messages']
+        else:
+            st.session_state['chat_memory']=[]
+    else:
+        st.session_state['chat_memory'] = []
+
 
 def get_secret():
+    """Get opensearch credentials (username and password) stored in secrete manager"""
+    
     secret_name = SECRETS_NAME
     region_name = REGION
 
@@ -137,8 +158,7 @@ def get_secret():
     session = boto3.session.Session()
     client = session.client(
         service_name='secretsmanager',
-        region_name=region_name
-    )
+        region_name=region_name)
 
     try:
         get_secret_value_response = client.get_secret_value(
@@ -148,7 +168,6 @@ def get_secret():
         # For a list of exceptions thrown, see
         # https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
         raise e
-
     # Decrypts secret using the associated KMS key.
     secret = get_secret_value_response['SecretString']
     return secret 
@@ -173,17 +192,17 @@ def token_cohere(path):
     tokenizer = Tokenizer.from_pretrained(path)
     return tokenizer
 
-def chunk_iterator(dir_path: str):
-    for root, _, filenames in os.walk(dir_path):
-        for filename in filenames:
-            file_path = os.path.join(root, filename)
-            if os.path.isfile(file_path):
-                with open(file_path, 'r') as file:
-                    file_contents = file.read()
-                    yield filename, file_contents
-
-
 def create_os_index(param, chunks):
+    """ Create an Opensearch Index
+        It uses four mappings:
+        - embedding: chunk vector embedding
+        - passage_id: document page number of chunk
+        - passage: chunk
+        - doc_id: name of document
+        
+        An opensearch undex is created per embedding model selected every subsequest indexing using that model, goes to the same opensearch index.
+        To use a new index, change teh opensearch domain name in the configuration json file.
+    """
     st.write("Indexing...")    
     es_username = OS_USERNAME
     es_password = OS_KEY 
@@ -238,7 +257,7 @@ def create_os_index(param, chunks):
         st.write('Index already exists!')
         
     i = 1
-    # doc_id=file_name
+  
     for pages, chunk in chunks.items(): # Iterate through dict with chunk page# and content
         chunk_id = pages.split('*')[0] # take care of multiple chunks in same page (*) is used as delimiter
         if "titan" in param["emb"].lower():
@@ -290,22 +309,13 @@ def create_os_index(param, chunks):
             break
     return domain_index
 
-# def split_doc(doc_name):    
-#     dir_name=doc_name.split('.')[0]
-#     inputpdf = PdfReader(open(doc_name, "rb"))
-#     Path(dir_name).mkdir(parents=True, exist_ok=True) 
-#     for i in range(len(inputpdf.pages)):
-#         output = PdfWriter()
-#         output.add_page(inputpdf.pages[i])
-#         with open(f"{dir_name}/{dir_name}-{i+1}.pdf" ,"wb") as outputStream:
-#             output.write(outputStream)    
-#     return dir_name
 
 def kendra_index(doc_name):
+    """Create kendra s3 data source and sync files into kendra index"""
     import time
     response=KENDRA.list_data_sources(IndexId=KENDRA_ID)['SummaryItems']
     data_sources=[x["Name"] for x in response if KENDRA_S3_DATA_SOURCE_NAME in x["Name"]]
-    if data_sources:
+    if data_sources: # Check if s3 data source already exist and sync files
         data_source_id=[x["Id"] for x in response if KENDRA_S3_DATA_SOURCE_NAME in x["Name"] ][0]
         sync_response = KENDRA.start_data_source_sync_job(
         Id = data_source_id,
@@ -326,7 +336,7 @@ def kendra_index(doc_name):
                 time.sleep(2)
             except:
                 time.sleep(2)
-    else:
+    else: # Create a Kendra s3 data source and sync files
         
         index_id=KENDRA_ID
         response = KENDRA.create_data_source(
@@ -369,7 +379,7 @@ def kendra_index(doc_name):
                 Id = data_source_id,
                 IndexId = index_id
             )
-            # For this example, there should be one job        
+                   
             try:
                 status = jobs["History"][0]["Status"]
                 st.write(" Syncing data source. Status: "+status)
@@ -381,7 +391,7 @@ def kendra_index(doc_name):
             
 def get_chunk_pages(page_dict,chunk):
     """
-    Getting chunk page number of each chunk to use as metadata
+    Getting chunk page number of each chunk to use as metadata while creating the opensearch index.
     """
     token_dict={}
     length=0
@@ -435,6 +445,12 @@ def chunker(chunk_size, file):
     return result
 
 def full_doc_extraction(file):    
+    """ This is the function for the full-page retrieval technique.
+        It uses the metadata collected from the retrieval system to get the original source document 
+        and extract the full page content, if pdf, or entire document content (txt, json, xml files etc.)
+        
+        You can append functions to handle any other file format including web bages.
+    """
     link=file.split('###')[0]
     if "pdf" in os.path.splitext(link)[-1]:
         files=file.split('###')
@@ -521,131 +537,335 @@ def full_doc_extraction(file):
     
     return result
 
-def doc_qna_endpoint(endpoint, responses,prompt,params, handler=None):
-    models=["claude","llama","cohere","ai21","titan"]
+def retrieval_quality_check(doc, question):
+    template=f"""\n\nHuman:
+Here is a document:
+<document>
+{doc}
+</document>      
+
+Here is a question:
+Question: {question}
+
+Review the document and check if the document is sufficient enough to answer the question completely.
+If the complete answer is contained in the document respond with:
+<answer>
+yes
+</answer>
+
+Else respond with:
+<answer>
+no
+</answer>
+
+Your response should not include any preamble, just provide the answer alone in your response.\n\nAssistant:"""
+
+    prompt={
+      "prompt": template,
+      "max_tokens_to_sample": 10,
+      "temperature": 0.1,
+      # "top_k": 250,
+      # "top_p": 1,  
+      #    "stop_sequences": []
+    }
+    prompt=json.dumps(prompt)
+    output = BEDROCK.invoke_model(body=prompt,
+                                    modelId='anthropic.claude-v2',  #Change model ID to a diffent anthropic model id
+                                    accept="application/json", 
+                                    contentType="application/json")
+
+    output=output['body'].read().decode()
+    answer=json.loads(output)['completion']
+    idx1 = answer.index('<answer>')
+    idx2 = answer.index('</answer>')
+    response=answer[idx1 + len('<answer>') + 1: idx2]
+    print(response)
+    return response
+
+def single_passage_retrieval(responses,prompt,params, handler=None):
+    """
+    Sends one retrieved passage a time per TopK selected to the LLM together with the user prompt.
+    """
+    models=["claude","llama","cohere","ai21","titan","mistral"] # mapping for the prompt template stored locally
     chosen_model=[x for x in models if x in params['model_name'].lower()][0]
     total_response=[]   
-
+    # Assigning roles dynamically to the LLM based on persona
     persona_dict={"General":"assistant","Finance":"finanacial analyst","Insurance":"insurance analyst","Medical":"medical expert"}
-    
+    with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1_1.txt","r") as f:
+            prompt_template=f.read()
     if "Kendra" in params["rag"]:
-        if 'combined-passages' in params['method']:
-            score = ", ".join([x['ScoreAttributes']["ScoreConfidence"]   for x in responses['ResultItems'][:round(params['K'])]]) 
-            doc_link = [x['DocumentURI'] for x in responses['ResultItems'][:round(params['K'])]]
-            # page_no=", ".join([str(x['DocumentAttributes'][1]['Value']['LongValue']) for x in responses['ResultItems'][:round(params['K'])]])   
-            page_no = ", ".join([x.split('/')[-1].split('-')[-1].split('.')[0] for x in doc_link])  
-            holder={}
-            for x,y in enumerate(responses['ResultItems'][:round(params['K'])]):
-                holder[x]={"document":y["Content"], "source":y['DocumentURI']}  
-            
-            with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
-                prompt_template=f.read()    
-            qa_prompt =prompt_template.format(doc=holder, prompt=prompt, role=persona_dict[params['persona']])
-            if "claude" in params['model_name'].lower():
-                qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"              
-            answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
-            answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
-            total_response.append(answer1)
-            return total_response
-        elif 'full-pages' in params['method']:            
-            score = ", ".join([x['ScoreAttributes']["ScoreConfidence"]   for x in responses['ResultItems'][:round(params['K'])]]) 
-            doc_link = [x['DocumentURI'] for x in responses['ResultItems'][:round(params['K'])]]
-            # page_no = ", ".join([x.split('/')[-1].split('-')[-1].split('.')[0] for x in doc_link])  
-            page_no=[str(x['DocumentAttributes'][1]['Value']['LongValue']) for x in responses['ResultItems'][:round(params['K'])]]
-            holder={}           
-            
-            from itertools import zip_longest
-            sources = []
-            # Use zip_longest to handle uneven lengths
-            for item1, item2 in zip_longest(doc_link, page_no, fillvalue=''):
-                sources.append('###'.join([str(item1), str(item2)]))
-                
-            page_no=", ".join(page_no)
-            
-            
-            import multiprocessing    
-            num_concurrent_invocations = len(sources)
-            pool = multiprocessing.Pool(processes=num_concurrent_invocations)            
-            context=pool.map(full_doc_extraction, sources)
-            pool.close()
-            pool.join() 
-            
-            with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
-                prompt_template=f.read()    
-            qa_prompt =prompt_template.format(doc=context, prompt=prompt, role=persona_dict[params['persona']])
+        for x in range(0, round(params['K'])): # provide an answer for each number of passage retrieved by the Retriever
+            score = responses['ResultItems'][x]['ScoreAttributes']["ScoreConfidence"]              
+            passage = responses['ResultItems'][x]['Content']
+            doc_link = responses['ResultItems'][x]['DocumentURI']
+            page_no=""                
+            if os.path.splitext(doc_link)[-1]:                    
+                page_no=responses['ResultItems'][x]['DocumentAttributes'][1]['Value']['LongValue']
+            s3_uri=responses['ResultItems'][x]['DocumentId']
+            doc_name=doc_link.split('/')[-1] if doc_link.split('/')[-1] else doc_link.split('/')[-2]
+            qa_prompt =prompt_template.format(doc=passage, prompt=prompt, role=persona_dict[params['persona']])
             if "claude" in params['model_name'].lower():
                 qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
-            
-            answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
-            answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
+
+            answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)         
+            answer1={'Answer':answer, 'Name':doc_name,'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
             total_response.append(answer1)
-            return total_response
-        elif 'single-passages' in params['method']:
-
-            with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1_1.txt","r") as f:
-                    prompt_template=f.read()
-            for x in range(0, round(params['K'])): 
-      
-                score = responses['ResultItems'][x]['ScoreAttributes']["ScoreConfidence"]              
-                passage = responses['ResultItems'][x]['Content']
-                doc_link = responses['ResultItems'][x]['DocumentURI']
-                page_no=responses['ResultItems'][x]['DocumentAttributes'][1]['Value']['LongValue']
-                s3_uri=responses['ResultItems'][x]['DocumentId']
-                    
-                qa_prompt =prompt_template.format(doc=passage, prompt=prompt, role=persona_dict[params['persona']])
-                if "claude" in params['model_name'].lower():
-                    qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
-                
-                answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
-         
-                answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
-                total_response.append(answer1)
-            return total_response
-        #passage=get_text_link(s3_uri)
     elif "OpenSearch" in params["rag"]:
-        if 'single-passages'  in params['method']: 
-            with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1_1.txt","r") as f:
-                    prompt_template=f.read()
-            for response in responses:            
-                score = response['_score']
-                passage = response['_source']['passage']
-                doc_link = f"https://{BUCKET}.s3.amazonaws.com/file_store/{response['_source']['doc_id']}"
-                page_no = response['_source']['passage_id']   
-                qa_prompt =prompt_template.format(doc=passage, prompt=prompt, role=persona_dict[params['persona']])
-                if "claude" in params['model_name'].lower():
-                    qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
-                answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
-                answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no,"Input Token":in_token,"Output Token":out_token}
-                total_response.append(answer1)
-            return total_response
-        elif 'combined-passages' or 'full-pages' in params['method']:
-            with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
-                    prompt_template=f.read()
-
-            score = ",".join([str(x['_score']) for x in responses])
-            passage = [x['_source']['passage'] for x in responses]
-            doc_link = f"https://{BUCKET}.s3.amazonaws.com/file_store/{responses[0]['_source']['doc_id']}"
-            page_no = ",".join([x['_source']['passage_id'] for x in responses])           
+        for response in responses:            
+            score = response['_score']
+            passage = response['_source']['passage']
+            doc_link = f"https://{BUCKET}.s3.amazonaws.com/file_store/{response['_source']['doc_id']}"
+            page_no = response['_source']['passage_id']   
+            doc_name = response['_source']['doc_id']   
             qa_prompt =prompt_template.format(doc=passage, prompt=prompt, role=persona_dict[params['persona']])
             if "claude" in params['model_name'].lower():
                 qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
             answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
-            answer1={'Answer':answer, 'Link':doc_link, 'Score':score, 'Page': page_no,"Input Token":in_token,"Output Token":out_token}
+            answer1={'Answer':answer, "Name":doc_name,'Link':doc_link, 'Score':score, 'Page': page_no,"Input Token":in_token,"Output Token":out_token}
+            total_response.append(answer1)
+
+    if params["memory"]:
+        chat_history={"user" :prompt,
+        "assistant":answer}           
+        if DYNAMODB_TABLE:
+            put_db(chat_history)
+        else:
+            st.session_state['chat_memory'].append(chat_history)            
+    return total_response
+
+def combined_passages_retrieval_technique(responses,prompt,params, handler=None):
+    """
+    Function implements the combined passaged retrieval technique.
+    It combines topK retrieved passages into a single context and pass to the text LLM together with the user prompt.
+    """
+    models=["claude","llama","cohere","ai21","titan","mistral"] # mapping for the prompt template stored locally
+    chosen_model=[x for x in models if x in params['model_name'].lower()][0]
+    # Assigning roles dynamically to the LLM based on persona
+    persona_dict={"General":"assistant","Finance":"finanacial analyst","Insurance":"insurance analyst","Medical":"medical expert"}  
+    
+    if "Kendra" in params["rag"]:
+        score = ", ".join([x['ScoreAttributes']["ScoreConfidence"]   for x in responses['ResultItems'][:round(params['K'])]]) 
+        doc_link = [x['DocumentURI'] for x in responses['ResultItems'][:round(params['K'])]]   
+        page_no=", ".join([str(x['DocumentAttributes'][1]['Value']['LongValue']) for x in responses['ResultItems'][:round(params['K'])] if os.path.splitext(x['DocumentURI'])[-1]])
+        doc_name=doc_name = ", ".join([x.split('/')[-1] if x.split('/')[-1] else x.split('/')[-2] for x in doc_link])
+        # page_no = ", ".join([x.split('/')[-1].split('-')[-1].split('.')[0] for x in doc_link])              
+
+        holder={}
+        for x,y in enumerate(responses['ResultItems'][:round(params['K'])]):
+            holder[x]={"document":y["Content"], "source":y['DocumentURI']}  
+        # Reading the prompt template based on chosen model and assigning the model roles based on chosen persona
+        with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
+            prompt_template=f.read()    
+        qa_prompt =prompt_template.format(doc=holder, prompt=prompt, role=persona_dict[params['persona']])
+        if "claude" in params['model_name'].lower():
+            qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"              
+        answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
+        answer1={'Answer':answer, 'Name':doc_name,'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
+        
+    elif "OpenSearch" in params["rag"]:
+        with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
+                        prompt_template=f.read()
+        score = ",".join([str(x['_score']) for x in responses])
+        passage = [x['_source']['passage'] for x in responses]
+        doc_link = f"https://{BUCKET}.s3.amazonaws.com/file_store/{responses[0]['_source']['doc_id']}"
+        page_no = ",".join([x['_source']['passage_id'] for x in responses])
+        doc_name = ", ".join([x['_source']['doc_id'] for x in responses])
+        qa_prompt =prompt_template.format(doc=passage, prompt=prompt, role=persona_dict[params['persona']])
+        if "claude" in params['model_name'].lower():
+            qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
+        answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
+        answer1={'Answer':answer, "Name":doc_name,'Link':doc_link, 'Score':score, 'Page': page_no,"Input Token":in_token,"Output Token":out_token}
+
+    # Saving chat history if enabled
+    if params["memory"]:
+        chat_history={"user" :prompt,
+        "assistant":answer}
+        # Store chat history in DynamoDb or in-memory
+        if DYNAMODB_TABLE:
+            put_db(chat_history)
+        else:
+            st.session_state['chat_memory'].append(chat_history)
+    return answer1
+
+def full_page_retrieval_technique_kendra(responses,prompt,params, handler=None):
+    """
+    Function implements the full-page retrieval technique.
+    It gets the metatdata (page number, doc location etc) from the topK retrieved responses.
+    extracts the entire page (if pdf) or entire doc (json, txt, etc.), combines all topK extraction into a single context and passes to the LLM
+    together with the user prompt.
+    """
+    models=["claude","llama","cohere","ai21","titan","mistral"] # mapping for the prompt template stored locally
+    chosen_model=[x for x in models if x in params['model_name'].lower()][0]
+
+    # Assigning roles dynamically to the LLM based on persona
+    persona_dict={"General":"assistant","Finance":"finanacial analyst","Insurance":"insurance analyst","Medical":"medical expert"}    
+    score = ", ".join([x['ScoreAttributes']["ScoreConfidence"]   for x in responses['ResultItems'][:round(params['K'])]]) 
+    doc_link = [x['DocumentURI'] for x in responses['ResultItems'][:round(params['K'])]]   
+    doc_name=", ".join([x.split('/')[-1] for x in doc_link])
+    sources = []  
+
+    page_no=[str(x['DocumentAttributes'][1]['Value']['LongValue']) for x in responses['ResultItems'][:round(params['K'])] if os.path.splitext(x['DocumentURI'])[-1]]
+    holder={}           
+
+    from itertools import zip_longest                  
+    for item1, item2 in zip_longest(doc_link, page_no, fillvalue=''):
+        sources.append('###'.join([str(item1), str(item2)]))
+    page_no=", ".join(page_no)   
+
+    ## Parallely extracting the full document pages
+    import multiprocessing    
+    num_concurrent_invocations = len(sources)
+    pool = multiprocessing.Pool(processes=num_concurrent_invocations)            
+    context=pool.map(full_doc_extraction, sources)
+    pool.close()
+    pool.join() 
+
+    with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
+        prompt_template=f.read()    
+    qa_prompt =prompt_template.format(doc=context, prompt=prompt, role=persona_dict[params['persona']])
+    if "claude" in params['model_name'].lower():
+        qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"  
+
+    answer, in_token, out_token=query_endpoint(params, qa_prompt,handler)
+    answer1={'Answer':answer, 'Name':doc_name,'Link':doc_link, 'Score':score, 'Page': page_no, "Input Token":in_token,"Output Token":out_token}
+
+    if params["memory"]:
+        chat_history={"user" :prompt,
+        "assistant":answer}           
+        if DYNAMODB_TABLE:
+            put_db(chat_history)
+        else:
+            st.session_state['chat_memory'].append(chat_history)
+    return answer1
+
+
+def doc_qna_endpoint(endpoint, responses,prompt,params, handler=None):
+    """This function implements the retrieval technique selected for each retriever, collects retrieved passage metadata and queries the 
+        Text generation LLm endpoint.
+    """
+    total_response=[]  
+    
+    # If auto retriever technique is selected, the an interim LLM call is made to check the quality of a single retrieved passage
+    if params["auto_rtv"]:          
+        passage = responses['ResultItems'][0]['Content']
+        q_c=retrieval_quality_check(passage, prompt)
+        # If the single passage contains sufficient information, pass to the final LLM to get a response
+        if "yes" in q_c:
+            params["K"]=1
+            total_response=single_passage_retrieval(responses,prompt,params, handler)                      
+            return total_response
+        else:
+            # If not, call the full_page_retriever technique with topK=3
+            params["K"]=3
+            answer1=full_page_retrieval_technique_kendra(responses,prompt,params, handler)
             total_response.append(answer1)
             return total_response
-          
-            
-            
-def query_endpoint(params, qa_prompt, handler=None):
     
-    if 'ai21' in params['model_name'].lower():
+    else:
+        if "Kendra" in params["rag"]:
+            if 'combined-passages' in params['method']:
+                answer1=combined_passages_retrieval_technique(responses,prompt,params, handler)
+                total_response.append(answer1)
+                return total_response
+            elif 'full-pages' in params['method']:            
+                answer1=full_page_retrieval_technique_kendra(responses,prompt,params, handler)
+                total_response.append(answer1)
+                return total_response
+            elif 'single-passages' in params['method']:
+                total_response=single_passage_retrieval(responses,prompt,params, handler)
+                return total_response
 
+        elif "OpenSearch" in params["rag"]:
+            if 'single-passages'  in params['method']:
+                total_response=single_passage_retrieval(responses,prompt,params, handler)
+                return total_response
+            elif 'combined-passages' or 'full-pages' in params['method']:
+                answer1=combined_passages_retrieval_technique(responses,prompt,params, handler)
+                total_response.append(answer1)
+                return total_response
+
+def llm_memory(question, params=None):
+    """ This function determines the context of each new question looking at the conversation history...
+        to send the appropiate question to the retriever.    
+        Messages are stored in DynamoDb if a table is provided or in memory, in the absence of a provided DynamoDb table
+    """
+    if DYNAMODB_TABLE:
+        chat_histories = DYNAMODB.Table(DYNAMODB_TABLE).get_item(Key={"UserId": DYNAMODB_USER})
+        if "Item" in chat_histories:
+            st.session_state['chat_memory']=chat_histories['Item']['messages']
+        else:
+            st.session_state['chat_memory']=[]    
+    
+    chat_string = ""
+    for entry in st.session_state['chat_memory']:
+        chat_string += f"user: {entry['user']}\nassistant: {entry['assistant']}\n"
+    memory_template = f"""\n\nHuman:
+Here is the history of your conversation dialogue with a user:
+<history>
+{chat_string}
+</history>
+
+Here is a new question from the user:
+user: {question}
+
+Your task is to determine if the question is a follow-up to the previous conversation:
+- If it is, rephrase the question as an independent question while retaining the original intent.
+- If it is not, respond with "_no_".
+
+Remember, your role is not to answer the question!
+
+Format your response as:
+<response>
+answer
+</response>\n\nAssistant:"""
+    if chat_string:
+        inference_modifier = {'max_tokens_to_sample':70, 
+                              "temperature":0.1,                   
+                             }
+        llm = Bedrock(model_id='anthropic.claude-v2', client=BEDROCK, model_kwargs = inference_modifier,
+                      streaming=False,  # Toggle this to turn streaming on or off
+                      callbacks=[StreamingStdOutCallbackHandler() ])
+        answer=llm(memory_template)
+        idx1 = answer.index('<response>')
+        idx2 = answer.index('</response>')
+        question_2=answer[idx1 + len('<response>') + 1: idx2]
+        if '_no_' not in question_2:
+            question=question_2
+        print(question)
+    return question
+
+def put_db(messages):
+    """Store long term chat history in DynamoDB"""
+    
+    chat_item = {
+        "UserId": DYNAMODB_USER,
+        "messages": [messages]  # Assuming 'messages' is a list of dictionaries
+    }
+
+    # Check if the user already exists in the table
+    existing_item = DYNAMODB.Table(DYNAMODB_TABLE).get_item(Key={"UserId": DYNAMODB_USER})
+
+    # If the user exists, append new messages to the existing ones
+    if "Item" in existing_item:
+        existing_messages = existing_item["Item"]["messages"]
+        chat_item["messages"] = existing_messages + [messages]
+
+    response = DYNAMODB.Table(DYNAMODB_TABLE).put_item(
+        Item=chat_item
+    )    
+    
+    
+def query_endpoint(params, qa_prompt, handler=None):
+    """
+    Function to query the LLM endpoint and count tokens in and out.
+    """
+    if 'ai21' in params['model_name'].lower():
         import json        
         prompt={
           "prompt":  qa_prompt,
           "maxTokens": params['max_len'],
           "temperature": round(params['temp'],2),
-          # "topP":  params['top_p'], 
+          "topP":  params['top_p'], 
         }
     
         prompt=json.dumps(prompt)
@@ -665,7 +885,7 @@ def query_endpoint(params, qa_prompt, handler=None):
         inference_modifier = { "max_tokens_to_sample": round(params['max_len']),
                               "temperature": params['temp'], 
                                 # "top_k": 50,
-                                # "top_p": params['top_p'],  
+                                "top_p": params['top_p'],  
                                  # "stop_sequences": []        
                                          }      
         qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"
@@ -678,10 +898,9 @@ def query_endpoint(params, qa_prompt, handler=None):
         tokens=claude.count_tokens(f"{qa_prompt} {answer}")
         st.session_state['token']+=tokens
 
-    elif 'titan' in params['model_name'].lower():
-      
+    elif 'titan' in params['model_name'].lower():      
         import json
-        encoding = tiktoken.get_encoding('cl100k_base')        
+        encoding = tiktoken.get_encoding('cl100k_base') #using openai tokenizer, replace with Titan's tokenizer        
         prompt={
                "inputText": qa_prompt,
                "textGenerationConfig": {
@@ -702,8 +921,7 @@ def query_endpoint(params, qa_prompt, handler=None):
         tokens=len(encoding.encode(f"{qa_prompt} {answer}"))
         st.session_state['token']+=tokens
         
-    elif 'cohere' in params['model_name'].lower():         
-        
+    elif 'cohere' in params['model_name'].lower():
         import json 
         inference_modifier = { 
                     "max_tokens": round(params['max_len']), 
@@ -717,29 +935,60 @@ def query_endpoint(params, qa_prompt, handler=None):
         input_token=len(encoding.encode(qa_prompt))
         output_token=len(encoding.encode(answer))
         tokens=len(encoding.encode(f"{qa_prompt} {answer}"))
-        st.session_state['token']+=tokens
+        st.session_state['token']+=tokens   
 
-    elif 'llama2' in params['model_name'].lower(): 
 
-        import boto3
-        import json       
-
+    elif 'mistral' in params['model_name'].lower(): 
+        import json
         payload = {
-           "inputs": qa_prompt,
-            "parameters": {"max_new_tokens": params['max_len'], 
-                           "top_p": params['top_p'] if params['top_p']<1 else 0.99 ,
-                           "temperature": params['temp'] if params['temp']>0 else 0.01,
-                           "return_full_text": False,}
-        }
-        llama=boto3.client("sagemaker-runtime")
-        output=llama.invoke_endpoint(Body=json.dumps(payload), EndpointName=params['endpoint-llm'],ContentType="application/json",CustomAttributes='accept_eula=true')
+               "inputs": qa_prompt,
+                "parameters": {"max_new_tokens": params['max_len'], 
+                               "top_p": params['top_p'] if params['top_p']<1 else 0.99 ,
+                               "temperature": params['temp'] if params['temp']>0 else 0.01,
+                               "return_full_text": False,}
+            } 
+        output=SAGEMAKER.invoke_endpoint(Body=json.dumps(payload), EndpointName=params['endpoint-llm'],ContentType="application/json")
         answer=json.loads(output['Body'].read().decode())[0]['generated_text']
-        tkn=token_counter("heilerich/llama-tokenizer-fast")
+        tkn=token_counter("mistralai/Mistral-7B-v0.1")
         input_token=len(tkn.encode(qa_prompt))
         output_token=len(tkn.encode(answer))       
         tokens=len(tkn.encode(f"{qa_prompt} {answer}"))
-        st.session_state['token']+=tokens       
-        
+        st.session_state['token']+=tokens    
+
+    elif 'llama2' in params['model_name'].lower():   
+        import json 
+        if "bedrock" in params['model_name'].lower(): 
+            
+            prompt={
+              "prompt": qa_prompt,
+                    "max_gen_len":params['max_len'], 
+                    "temperature":params['temp'] if params['temp']>0 else 0.01,
+                    "top_p": params['top_p'] if params['top_p']<1 else 0.99 
+            }
+            prompt=json.dumps(prompt)
+
+            output = BEDROCK.invoke_model(body=prompt,
+                                            modelId=params['endpoint-llm'],
+                                            accept="application/json", 
+                                            contentType="application/json")
+
+            output=output['body'].read().decode()
+            answer=json.loads(output)['generation']
+        else:            
+            payload = {
+               "inputs": qa_prompt,
+                "parameters": {"max_new_tokens": params['max_len'], 
+                               "top_p": params['top_p'] if params['top_p']<1 else 0.99 ,
+                               "temperature": params['temp'] if params['temp']>0 else 0.01,
+                               "return_full_text": False,}
+            }
+            output=SAGEMAKER.invoke_endpoint(Body=json.dumps(payload), EndpointName=params['endpoint-llm'],ContentType="application/json",CustomAttributes='accept_eula=true')
+            answer=json.loads(output['Body'].read().decode())[0]['generated_text']
+        tkn=token_counter('meta-llama/Llama-2-13b-chat-hf')
+        input_token=len(tkn.encode(qa_prompt))
+        output_token=len(tkn.encode(answer))       
+        tokens=len(tkn.encode(f"{qa_prompt} {answer}"))
+        st.session_state['token']+=tokens    
     return answer, input_token, output_token
         
 
@@ -796,6 +1045,7 @@ def extract_text_single(file):
     return result,bbox
 
 def similarity_search(payload, param): 
+    """ Function to run similarity search against OpenSearch index"""
     if "titan" in param["emb"].lower():
         prompt= {
             "inputText": payload
@@ -855,7 +1105,8 @@ def similarity_search(payload, param):
     return hits
 
 @st.cache_data
-def extract_text(bucket, filepath):   
+def extract_text(bucket, filepath):  
+    """Function to call textract asynchrounous document text extraction"""
     st.write('Extracting Text')
     response = TEXTRACT.start_document_text_detection(DocumentLocation={'S3Object': {'Bucket':bucket, 'Name':filepath}},JobTag='Employee')
     maxResults = 1000
@@ -909,12 +1160,12 @@ def extract_text(bucket, filepath):
     total_words=" ".join([x for x in total_words])
     return dict_words
 
-#function to summarize initial chunks
+
 def summarize_section(payload):
     """
     Initial summary of chunks
     """
-    models=["claude","llama","cohere","ai21","titan"]
+    models=["claude","llama","cohere","ai21","titan","mistral"]
     chosen_model=[x for x in models if x in payload['model_name'].lower()][0]
     with open(f"{PARENT_TEMPLATE_PATH}/summary/{chosen_model}/{payload['persona'].lower()}.txt","r") as f:
         prompt_template=f.read()    
@@ -929,7 +1180,7 @@ def summarize_final(payload, handler=None):
     """
     Final summary of of all chunks summary
     """
-    models=["claude","llama","cohere","ai21","titan"]
+    models=["claude","llama","cohere","ai21","titan", "mistral"]
     chosen_model=[x for x in models if x in payload['model_name'].lower()][0]
     with open(f"{PARENT_TEMPLATE_PATH}/summary/{chosen_model}/{payload['persona'].lower()}.txt","r") as f:
         prompt_template=f.read()    
@@ -940,8 +1191,6 @@ def summarize_final(payload, handler=None):
     response,i_t,o_t= query_endpoint(payload, prompt, handler)
     return response 
 
-
-#function to split extracted text to chunks
 def split_into_sections(paragraph: str, max_words: int) -> list: 
     """
     For Batch document Summarization.
@@ -989,6 +1238,7 @@ def sec_chunking(word_length,text):
     return sec_partial_summary
 
 def summarize_context(params):
+    """Function for Batch Document Summary"""
     st.title('Batch Document Summarization') 
 
     if st.button('Summarize', type="primary"):        
@@ -997,7 +1247,7 @@ def summarize_context(params):
         if "claude" in params['model_name'].lower():
             claude = Anthropic()
             token_length=claude.count_tokens(text)
-            chunking_needed=token_length>80000
+            chunking_needed=token_length>90000
         elif "llama" in params['model_name'].lower():
             tkn=token_counter('meta-llama/Llama-2-13b-chat-hf')
             token_length=len(tkn.encode(text))
@@ -1015,6 +1265,10 @@ def summarize_context(params):
             encoding = tiktoken.get_encoding('cl100k_base')
             token_length=len(encoding.encode(text))
             chunking_needed=token_length>6000
+        elif "mistral" in params['model_name'].lower():
+            tkn=token_counter('"mistralai/Mistral-7B-v0.1"')
+            token_length=len(tkn.encode(text))
+            chunking_needed=token_length>7000
         tic = time.time()        
         container_summ=st.empty()
         stream_handler = StreamHandler(container_summ)
@@ -1074,7 +1328,7 @@ def summarize_sect(param, payload, handler=None):
     """
     Summary function for Document Insights Action
     """
-    models=["claude","llama","cohere","ai21","titan"]
+    models=["claude","llama","cohere","ai21","titan","mistral"]
     chosen_model=[x for x in models if x in param['model_name'].lower()][0]
     with open(f"{PARENT_TEMPLATE_PATH}/summary/{chosen_model}/{param['persona'].lower()}.txt","r") as f:
         prompt_template=f.read()    
@@ -1087,6 +1341,7 @@ def summarize_sect(param, payload, handler=None):
     return response  
 
 def extract_entities(text, entities):
+    """Comprehend extract text entities"""
     extracted_data = {}
 
     for entity in entities:
@@ -1096,7 +1351,6 @@ def extract_entities(text, entities):
 
         if entity_type not in extracted_data:
             extracted_data[entity_type] = []
-
         extracted_data[entity_type].append(text[begin_offset:end_offset])
 
     return extracted_data
@@ -1178,21 +1432,32 @@ def page_summary(pdf_file,params):
                 image_b=pix.tobytes("png", 100)
                 text, bbox=extract_text_single(image_b)
                 persona_dict={"General":"assistant","Finance":"finanacial analyst","Insurance":"insurance analyst","Medical":"medical expert"}
-                with container:
-                    with st.form(key='my_form', clear_on_submit=True):
-                        user_input = st.text_area("You:", key='input', height=100)
-                        submit_button = st.form_submit_button(label='Send')
-                    # Initialise session state variables
+                               
                     
+                with container:
+                    with st.form(key="chat_users", clear_on_submit=True):
+                        user_input = st.text_area("You:", key="user_chatter", height=100)
+                        submit_button = st.form_submit_button(label='Send')               
+     
+                    if params["memory"]:
+                        user_input=llm_memory(user_input, params=None)
+                        
                     if submit_button and user_input:
-                        models=["claude","llama","cohere","ai21","titan"]
+                        models=["claude","llama","cohere","ai21","titan","mistral"]
                         chosen_model=[x for x in models if x in params['model_name'].lower()][0]
                         with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
                             prompt_template=f.read()    
                         prompt =prompt_template.format(doc=text, prompt=user_input, role=persona_dict[params['persona']])
                         if "claude" in params['model_name'].lower():
                             prompt=f"\n\nHuman:\n{prompt}\n\nAssistant:"
-                        output_answer, input_tok, output_tok=query_endpoint(params,prompt)               
+                        output_answer, input_tok, output_tok=query_endpoint(params,prompt)                   
+                        if params["memory"]:
+                            chat_history={"user" :user_input,
+                            "assistant":output_answer}           
+                            if DYNAMODB_TABLE:
+                                put_db(chat_history)
+                            else:
+                                st.session_state['chat_memory'].append(chat_history)
 
                         st.session_state['message'].append({"\nAnswer": output_answer})
                         st.session_state['past'].append(user_input)             
@@ -1201,9 +1466,9 @@ def page_summary(pdf_file,params):
                 if st.session_state['generate']:
                     with response_container:
                         for i in range(len(st.session_state['generate'])):
-                            message(st.session_state["past"][i].replace("$","USD ").replace("%", " percent"), is_user=True, key=str(uuid.uuid4()))
+                            message(st.session_state["past"][i].replace("$","USD ").replace("%", " percent"), is_user=True,key=str(uuid.uuid4()))
                             output_answer=json.loads(st.session_state["generate"][i])              
-                            message(output_answer.replace("$","USD ").replace("%", " percent"))
+                            message(output_answer.replace("$","USD ").replace("%", " percent"),key=str(uuid.uuid4()))
 
         
 def action_doc(params):   
@@ -1219,10 +1484,12 @@ def action_doc(params):
             with st.expander(label="**Additional Response**"):
                 st.markdown(message["step"])
                     
-    if prompt := st.chat_input(""):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    if prompt := st.chat_input(""):  
+        if params["memory"]:
+            prompt=llm_memory(prompt, params=None) 
         with st.chat_message("user"):
-            st.markdown(prompt)
+            st.markdown(prompt)       
+        st.session_state.messages.append({"role": "user", "content": prompt})
 
         if round(params["K"])>1 and params['method']=="single-passages":
             with st.chat_message("assistant"):
@@ -1231,12 +1498,13 @@ def action_doc(params):
                 if "Kendra" in params["rag"]:
                     response=query_index(prompt)  
                 elif "OpenSearch" in params["rag"]:            
-                    response=similarity_search(prompt, params)                
+                    response=similarity_search(prompt, params) 
                 output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params,[stream_handler])
                 message_placeholder.markdown(output_answer[0]['Answer'].replace("$","USD ").replace("%", " percent"))
                 with st.expander(label="**Metadata**"):             
                     steps=f"""
 - **Source:** [1]({output_answer[0]['Link']})
+- **Name:** {output_answer[0]['Name']} 
 - **Page:** {output_answer[0]['Page']} 
 - **Confidence:** {output_answer[0]['Score']}  
 - **Input Token:** {output_answer[0]['Input Token']}
@@ -1251,6 +1519,7 @@ def action_doc(params):
                     steps=f"""
 - **Answer {k+1}**: {output_answer[k]['Answer'].replace("$","USD ").replace("%", " percent")}
 - **Source:** [{k+1}]({output_answer[k]['Link']})
+- **Name:** {output_answer[k]['Name']} 
 - **Page:** {output_answer[k]['Page']} 
 - **Confidence:** {output_answer[k]['Score']}
 - **Input Token:** {output_answer[0]['Input Token']}
@@ -1286,6 +1555,7 @@ def action_doc(params):
                 with st.expander(label="**Metadata**"):             
                     steps=f"""
 - **Source:** {links}
+- **Name:** {output_answer[0]['Name']} 
 - **Page:** {output_answer[0]['Page']} 
 - **Confidence:** {output_answer[0]['Score']}
 - **Input Token:** {output_answer[0]['Input Token']}
@@ -1327,11 +1597,13 @@ def app_sidebar():
                 text=load_document_batch_summary(file.read(), file_name)
                 st.session_state['text'] =text
                 
-        if 'Document Insights' in action_name:           
+        if 'Document Insights' in action_name:    
+            mem = st.checkbox('chat memory')
             max_len = st.slider('Output Length', min_value=50, max_value=2000, value=250, step=10)
             top_p = st.slider('Top p', min_value=0., max_value=1., value=1., step=.01)
             temp = st.slider('Temperature', min_value=0., max_value=1., value=0.01, step=.01)
-            params = {'action_name':action_name, 'endpoint-llm':MODELS_LLM[llm_model_name],'max_len':max_len, 'top_p':top_p, 'temp':temp, 'model_name':llm_model_name, "persona":persona }   
+            params = {'action_name':action_name, 'endpoint-llm':MODELS_LLM[llm_model_name],'max_len':max_len, 'top_p':top_p, 'temp':temp, 'model_name':llm_model_name, "persona":persona ,"memory":mem }   
+            
 
             
             if file is not None:
@@ -1342,18 +1614,28 @@ def app_sidebar():
             
 
         elif 'Document Query' in action_name: 
-            methods=st.selectbox('retrieval technique', ["single-passages",'combined-passages','full-pages'])
+            mem = st.checkbox('chat memory')
+            
+            auto_rtv=st.checkbox('Auto Retrieval Technique')
+            if auto_rtv:
+                methods=""
+            else:
+                methods=st.selectbox('retrieval technique', ["single-passages",'combined-passages','full-pages'])
             st.session_state['rtv']=methods
             max_len = st.slider('Output Length', min_value=50, max_value=2000, value=150, step=10)
             top_p = st.slider('Top p', min_value=0., max_value=1., value=1., step=.01)
             temp = st.slider('Temperature', min_value=0., max_value=1., value=0.01, step=.01)
             
             retriever = st.selectbox('Retriever', ("Kendra", "OpenSearch"))
+            if auto_rtv:
+                K=0
+            else:
+                K=st.slider('Top K Results', min_value=1., max_value=10., value=1., step=1.,key='kendra')
 
             if "OpenSearch" in retriever:
                 embedding_model=st.selectbox('Embedding Model', MODELS_EMB.keys())
                 knn=st.slider('Query Nearest Neighbour', min_value=1., max_value=100., value=3., step=1.)
-                K=st.slider('Top K results', min_value=1., max_value=10., value=1., step=1.)
+                # K=st.slider('Top K results', min_value=1., max_value=10., value=1., step=1.)
                 engine=st.selectbox('KNN algorithm', ("nmslib", "lucene"), help="Underlying KNN algorithm implementation to use for powering the KNN search")
                 m=st.slider('Neighbouring Points', min_value=16.0, max_value=124.0, value=72.0, step=1., help="Explored neighbors count")
                 ef_search=st.slider('efSearch', min_value=10.0, max_value=2000.0, value=1000.0, step=10., help="Exploration Factor")
@@ -1364,11 +1646,11 @@ def app_sidebar():
                 params = {'action_name':action_name, 'endpoint-llm':MODELS_LLM[llm_model_name],'max_len':max_len, 'top_p':top_p, 'temp':temp, 
                           'model_name':llm_model_name, "emb_model":MODELS_EMB[embedding_model], "rag":retriever,"K":K, "engine":engine, "m":m,
                          "ef_search":ef_search, "ef_construction":ef_construction, "chunk":chunk, "domain":st.session_state['domain'], "knn":knn,
-                         'emb':embedding_model, 'method':methods, "persona":persona }   
+                         'emb':embedding_model, 'method':methods, "persona":persona,"memory":mem,"auto_rtv":auto_rtv }   
           
             else:
-                K=st.slider('Top K Results', min_value=1., max_value=10., value=1., step=1.,key='kendra')
-                params = {'action_name':action_name, 'endpoint-llm':MODELS_LLM[llm_model_name],"K":K,'max_len':max_len, 'top_p':top_p, 'temp':temp, 'model_name':llm_model_name, "rag":retriever, 'method':methods, "persona":persona }   
+                
+                params = {'action_name':action_name, 'endpoint-llm':MODELS_LLM[llm_model_name],"K":K,'max_len':max_len, 'top_p':top_p, 'temp':temp, 'model_name':llm_model_name, "rag":retriever, 'method':methods, "persona":persona,"memory":mem ,"auto_rtv":auto_rtv }   
                 
            
             if file is not None:
@@ -1382,7 +1664,6 @@ def app_sidebar():
 
 def main():
     params,f = app_sidebar()
-    #endpoint=params['endpoint']
     if params['action_name'] =='Batch Document Summary':
         summarize_context(params) 
     elif params['action_name'] =='Document Insights':
