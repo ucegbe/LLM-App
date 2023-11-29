@@ -32,9 +32,7 @@ You would need to set up the following before succesfully using this app:
     - Kendra execution role value
     - Kendra index value 
     - Kendra S3 data source name
-    - Amazon OpenSearch parameters (domain endpoint **e.g. my-test-domain.us-east-1.es.amazonaws.com**)
-    - Digital certificate path (tls_cert_path)**   
-    
+    - Amazon OpenSearch parameters (domain endpoint **e.g. my-test-domain.us-east-1.es.amazonaws.com**)    
     ** Optional 
     
    

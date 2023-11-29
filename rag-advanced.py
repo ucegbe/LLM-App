@@ -11,7 +11,6 @@ from PIL import Image
 from io import BytesIO
 from PyPDF2 import PdfWriter, PdfReader
 import requests
-from requests.auth import HTTPBasicAuth
 import tiktoken
 from tqdm import tqdm
 import yaml
@@ -26,7 +25,6 @@ import io
 import json
 from tokenizers import Tokenizer
 from transformers import AutoTokenizer
-import streamlit.components.v1 as streamcomponents
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from requests_aws4auth import AWS4Auth
 
@@ -46,8 +44,6 @@ KENDRA_ID = APP_MD['Kendra']['index']
 KENDRA_ROLE=APP_MD['Kendra']['role']
 PARENT_TEMPLATE_PATH="prompt_template"
 KENDRA_S3_DATA_SOURCE_NAME=APP_MD['Kendra']['s3_data_source_name']
-
-TLS_CERT_PATH = APP_MD['tls_cert_path']
 try:
     DYNAMODB_TABLE=APP_MD['dynamodb_table']
     DYNAMODB_USER=APP_MD['dynamodb_user']
@@ -165,7 +161,7 @@ def create_os_index(param, chunks):
         http_auth = awsauth,
         use_ssl = True,
         verify_certs = True,
-        timeout=120,
+        timeout=120,        
         # http_compress = True, # enables gzip compression for request bodies
         connection_class = RequestsHttpConnection
     )
