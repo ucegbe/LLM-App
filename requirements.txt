@@ -13,4 +13,5 @@ streamlit_chat
 pymupdf
 tokenizers
 transformers
-langchain
+opensearch-py
+requests-aws4auth

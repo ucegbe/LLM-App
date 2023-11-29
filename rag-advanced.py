@@ -27,9 +27,8 @@ import json
 from tokenizers import Tokenizer
 from transformers import AutoTokenizer
 import streamlit.components.v1 as streamcomponents
-from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from langchain.llms.bedrock import Bedrock
-from langchain.callbacks.base import BaseCallbackHandler
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
 
 st.set_page_config(layout="wide")
 logger = logging.getLogger('sagemaker')
@@ -47,9 +46,8 @@ KENDRA_ID = APP_MD['Kendra']['index']
 KENDRA_ROLE=APP_MD['Kendra']['role']
 PARENT_TEMPLATE_PATH="prompt_template"
 KENDRA_S3_DATA_SOURCE_NAME=APP_MD['Kendra']['s3_data_source_name']
-HEIGHT=500 # Height of Streamlit container for output text
+
 TLS_CERT_PATH = APP_MD['tls_cert_path']
-SECRETS_NAME=APP_MD['secrets']
 try:
     DYNAMODB_TABLE=APP_MD['dynamodb_table']
     DYNAMODB_USER=APP_MD['dynamodb_user']
@@ -85,26 +83,6 @@ EMB_MODEL_DOMAIN_NAME={"titan":f"{APP_MD['opensearch']['domain_name']}_titan",
                 "e5largemultilingual":f"{APP_MD['opensearch']['domain_name']}_e5largeml",
                "gptj6b":f"{APP_MD['opensearch']['domain_name']}_gptj6b",
                        "cohere":f"{APP_MD['opensearch']['domain_name']}_cohere"}
-
-
-# Enable streaming on Streamlit using Langchain callback handler
-class StreamHandler(BaseCallbackHandler):
-    def __init__(self, container, initial_text=""):
-        self.container = container
-        self.text=initial_text
-    def on_llm_new_token(self, token: str, **kwargs) -> None:
-  
-        self.text+=token+""
-        self.text=self.text.replace("$","USD ").replace("%", " percent")
-        if st.session_state['action_name']=='Document Query' or st.session_state['action_name']=='Document Insights':
-            self.container.markdown(self.text)
-        else:
-            with self.container:
-                streamcomponents.html(
-                            "<br>"+self.text.replace("\n", "<br>"),
-                            height=HEIGHT,
-                            scrolling=True,
-                        )
 
 # Session state keys
 if 'generate' not in st.session_state:
@@ -148,32 +126,6 @@ if 'chat_memory' not in st.session_state:
         st.session_state['chat_memory'] = []
 
 
-def get_secret():
-    """Get opensearch credentials (username and password) stored in secrete manager"""
-    
-    secret_name = SECRETS_NAME
-    region_name = REGION
-
-    # Create a Secrets Manager client
-    session = boto3.session.Session()
-    client = session.client(
-        service_name='secretsmanager',
-        region_name=region_name)
-
-    try:
-        get_secret_value_response = client.get_secret_value(
-            SecretId=secret_name
-        )
-    except ClientError as e:
-        # For a list of exceptions thrown, see
-        # https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
-        raise e
-    # Decrypts secret using the associated KMS key.
-    secret = get_secret_value_response['SecretString']
-    return secret 
-
-OS_KEY = json.loads(get_secret())['password']
-OS_USERNAME =  json.loads(get_secret())['username']
 
 def query_index(query):  
     response = KENDRA.retrieve(
@@ -204,12 +156,20 @@ def create_os_index(param, chunks):
         To use a new index, change teh opensearch domain name in the configuration json file.
     """
     st.write("Indexing...")    
-    es_username = OS_USERNAME
-    es_password = OS_KEY 
     domain_endpoint = OS_ENDPOINT
-    domain_index = param['domain']
-    URL = f'{domain_endpoint}/{domain_index}'
-    
+    service = 'es'
+    credentials = boto3.Session().get_credentials()
+    awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, REGION, service, session_token=credentials.token)
+    os_ = OpenSearch(
+        hosts = [{'host': OS_ENDPOINT, 'port': 443}],
+        http_auth = awsauth,
+        use_ssl = True,
+        verify_certs = True,
+        timeout=120,
+        # http_compress = True, # enables gzip compression for request bodies
+        connection_class = RequestsHttpConnection
+    )
+
     mapping = {
       'settings': {
         'index': {  
@@ -249,12 +209,18 @@ def create_os_index(param, chunks):
             }
           }
         }
-    response = requests.head(URL, auth=HTTPBasicAuth(es_username, es_password),timeout=60,verify= TLS_CERT_PATH if TLS_CERT_PATH else True)  
-    if response.status_code == 404:
-        response = requests.put(URL, auth=HTTPBasicAuth(es_username, es_password), json=mapping,timeout=240,verify= TLS_CERT_PATH if TLS_CERT_PATH else True)  
-        st.write(f'Index created: {response.text}')
+
+    domain_index = f"{param['domain']}_{param['engine']}"    
+    
+    if not os_.indices.exists(index=domain_index):        
+        os_.indices.create(index=domain_index, body=mapping)
+        # Verify that the index has been created
+        if os_.indices.exists(index=domain_index):
+            st.write(f"Index {domain_index} created successfully.")
+        else:
+            st.write(f"Failed to create index '{domain_index}'.")
     else:
-        st.write('Index already exists!')
+        st.write(f'{domain_index} Index already exists!')
         
     i = 1
   
@@ -301,12 +267,16 @@ def create_os_index(param, chunks):
             'passage_id': chunk_id,
             'passage': chunk, 
             'embedding': embedding}
-        response = requests.post(f'{URL}/_doc/{i}', auth=HTTPBasicAuth(es_username, es_password), json=document,timeout=120,verify= TLS_CERT_PATH if TLS_CERT_PATH else True)  
-        i += 1
-        if response.status_code not in [200, 201]:
-            logger.error(response.status_code)
-            logger.error(response.text)
-            break
+        try:
+            response = os_.index(index=domain_index, body=document)
+            i += 1
+            # Check the response to see if the indexing was successful
+            if response["result"] == "created":
+                print(f"Document indexed successfully with ID: {response['_id']}")
+            else:
+                print("Failed to index document.")
+        except RequestError as e:
+            logging.error(f"Error indexing document to index '{domain_index}': {e}")
     return domain_index
 
 
@@ -591,7 +561,7 @@ def single_passage_retrieval(responses,prompt,params, handler=None):
     total_response=[]   
     # Assigning roles dynamically to the LLM based on persona
     persona_dict={"General":"assistant","Finance":"finanacial analyst","Insurance":"insurance analyst","Medical":"medical expert"}
-    with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1_1.txt","r") as f:
+    with open(f"{PARENT_TEMPLATE_PATH}/rag/{chosen_model}/prompt1.txt","r") as f:
             prompt_template=f.read()
     if "Kendra" in params["rag"]:
         for x in range(0, round(params['K'])): # provide an answer for each number of passage retrieved by the Retriever
@@ -853,8 +823,23 @@ def put_db(messages):
     response = DYNAMODB.Table(DYNAMODB_TABLE).put_item(
         Item=chat_item
     )    
-    
-    
+
+
+def llm_streamer():
+    output = ""
+    i = 1
+    if stream:
+        for event in stream:
+            chunk = event.get('chunk')
+            if chunk:
+                chunk_obj = json.loads(chunk.get('bytes').decode())
+                text = chunk_obj["generation"]
+                output+=text
+                print(f'{text}', end="")
+                i+=1
+
+
+
 def query_endpoint(params, qa_prompt, handler=None):
     """
     Function to query the LLM endpoint and count tokens in and out.
@@ -882,16 +867,30 @@ def query_endpoint(params, qa_prompt, handler=None):
         st.session_state['token']+=tokens
 
     elif 'claude' in params['model_name'].lower():
-        inference_modifier = { "max_tokens_to_sample": round(params['max_len']),
-                              "temperature": params['temp'], 
-                                # "top_k": 50,
-                                "top_p": params['top_p'],  
-                                 # "stop_sequences": []        
-                                         }      
+        import json       
         qa_prompt=f"\n\nHuman:\n{qa_prompt}\n\nAssistant:"
-        prompt=qa_prompt
-        llm = Bedrock(model_id=params['endpoint-llm'],  client=BEDROCK, model_kwargs = inference_modifier,streaming=True if handler else False,   callbacks=handler)        
-        answer=llm.invoke(prompt)       
+        prompt={
+          "prompt": qa_prompt,
+          "max_tokens_to_sample": round(params['max_len']),
+          "temperature": params['temp'],
+          # "top_k": 250,
+          "top_p":params['top_p'],  
+             # "stop_sequences": []
+        }
+        prompt=json.dumps(prompt)
+        response = BEDROCK.invoke_model_with_response_stream(body=prompt, modelId=params['endpoint-llm'], accept="application/json",  contentType="application/json")
+        stream = response.get('body')
+        answer = ""
+        i = 1
+        if stream:
+            for event in stream:
+                chunk = event.get('chunk')
+                if chunk:
+                    chunk_obj = json.loads(chunk.get('bytes').decode())
+                    text = chunk_obj['completion']
+                    answer+=text
+                    handler.markdown(answer.replace("$","USD ").replace("%", " percent"))                  
+                    i+=1      
         claude = Anthropic()
         input_token=claude.count_tokens(qa_prompt)
         output_token=claude.count_tokens(answer)
@@ -910,27 +909,46 @@ def query_endpoint(params, qa_prompt, handler=None):
                    },
             }
         prompt=json.dumps(prompt)
-        response = BEDROCK.invoke_model(body=prompt,
-                                modelId=params['endpoint-llm'], 
-                                accept="application/json", 
-                                contentType="application/json")
-        answer=response['body'].read().decode()
-        answer=json.loads(answer)['results'][0]['outputText']
+        response = BEDROCK.invoke_model_with_response_stream(body=prompt, modelId=params['endpoint-llm'], accept="application/json",  contentType="application/json")
+        stream = response.get('body')
+        answer = ""
+        i = 1
+        if stream:
+            for event in stream:
+                chunk = event.get('chunk')
+                if chunk:
+                    chunk_obj = json.loads(chunk.get('bytes').decode())
+                    text = chunk_obj["outputText"]
+                    answer+=text
+                    handler.markdown(answer.replace("$","USD ").replace("%", " percent"))                  
+                    i+=1   
         input_token=len(encoding.encode(qa_prompt))
         output_token=len(encoding.encode(answer))
         tokens=len(encoding.encode(f"{qa_prompt} {answer}"))
         st.session_state['token']+=tokens
         
     elif 'cohere' in params['model_name'].lower():
-        import json 
-        inference_modifier = { 
-                    "max_tokens": round(params['max_len']), 
-                     "temperature": params['temp'], 
-                    "return_likelihoods": "GENERATION"   
-                     }  
-        prompt=qa_prompt
-        llm = Bedrock(model_id=params['endpoint-llm'],  client=BEDROCK, model_kwargs = inference_modifier,streaming=True if handler else False,  callbacks=handler) 
-        answer=llm.invoke(prompt)    
+        import json         
+        prompt={
+          "prompt": qa_prompt,
+          "max_tokens": round(params['max_len']), 
+          "temperature": params['temp'], 
+          "return_likelihoods": "GENERATION"   
+        }
+        prompt=json.dumps(prompt)
+        response = BEDROCK.invoke_model_with_response_stream(body=prompt, modelId=params['endpoint-llm'], accept="application/json",  contentType="application/json")
+        stream = response.get('body')
+        answer = ""
+        i = 1
+        if stream:
+            for event in stream:
+                chunk = event.get('chunk')
+                if chunk:
+                    chunk_obj = json.loads(chunk.get('bytes').decode())
+                    text = chunk_obj["generations"][0]['text']
+                    answer+=text
+                    handler.markdown(answer.replace("$","USD ").replace("%", " percent"))                  
+                    i+=1    
         encoding=token_cohere("Cohere/command-nightly")
         input_token=len(encoding.encode(qa_prompt))
         output_token=len(encoding.encode(answer))
@@ -966,14 +984,20 @@ def query_endpoint(params, qa_prompt, handler=None):
                     "top_p": params['top_p'] if params['top_p']<1 else 0.99 
             }
             prompt=json.dumps(prompt)
-
-            output = BEDROCK.invoke_model(body=prompt,
-                                            modelId=params['endpoint-llm'],
-                                            accept="application/json", 
-                                            contentType="application/json")
-
-            output=output['body'].read().decode()
-            answer=json.loads(output)['generation']
+            # st.write(prompt)
+            response = BEDROCK.invoke_model_with_response_stream(body=prompt, modelId=params['endpoint-llm'], accept="application/json",  contentType="application/json")
+            stream = response.get('body')
+            answer = ""
+            i = 1
+            if stream:
+                for event in stream:
+                    chunk = event.get('chunk')
+                    if chunk:
+                        chunk_obj = json.loads(chunk.get('bytes').decode())
+                        text = chunk_obj["generation"]
+                        answer+=text
+                        handler.markdown(answer.replace("$","USD ").replace("%", " percent"))                  
+                        i+=1      
         else:            
             payload = {
                "inputs": qa_prompt,
@@ -1095,13 +1119,23 @@ def similarity_search(payload, param):
         }
       }
     }
-    es_username = OS_USERNAME
-    es_password = OS_KEY 
-    domain_endpoint = OS_ENDPOINT
-    URL = f'{domain_endpoint}/{param["domain"]}/_search'     
-    response = requests.post(URL, auth=HTTPBasicAuth(es_username, es_password), json=query, timeout=120,verify= TLS_CERT_PATH if TLS_CERT_PATH else True)  
-    response_json = response.json()
-    hits = response_json['hits']['hits']    
+    
+
+    service = 'es'
+    credentials = boto3.Session().get_credentials()
+    awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, REGION, service, session_token=credentials.token)
+    os_ = OpenSearch(
+        hosts = [{'host': OS_ENDPOINT, 'port': 443}],
+        http_auth = awsauth,
+        use_ssl = True,
+        verify_certs = True,
+        timeout=120,
+        # http_compress = True, # enables gzip compression for request bodies
+        connection_class = RequestsHttpConnection
+    )
+    domain_index=f"{param['domain']}_{param['engine']}"
+    response = os_.search(index=domain_index, body=query)
+    hits = response['hits']['hits']    
     return hits
 
 @st.cache_data
@@ -1126,7 +1160,7 @@ def extract_text(bucket, filepath):
             response = TEXTRACT.get_document_text_detection(JobId=jobId,
                                                                  MaxResults=maxResults,
                                                                  NextToken=paginationToken)
-        #print(response['JobStatus'])
+    
         while response['JobStatus'] != 'SUCCEEDED':
             time.sleep(2)     
             if paginationToken == None:
@@ -1222,18 +1256,18 @@ def first_summ(params, section):
     summaries = summarize_section(params)    
     return summaries
 
-def sec_chunking(word_length,text): 
+def sec_chunking(word_length,text, params): 
     sec_partial_summary=[]
-    num_chunks=word_length//3000
+    num_chunks=word_length//(2000 if not "mistral" in params['model_name'].lower() else 4500)
     #further chucking of initial summary and summarizing (summary of summary) 
     for i in range(num_chunks): 
-        num_summary=len(text.split('##\n\n'))//num_chunks
+        num_summary=len(text.split('##'))//num_chunks
         start = i * num_summary  
         end = (i+1) * num_summary
         if i+1==num_chunks:
-            part_summary="\n\n".join([x for x in text.split('##\n\n')[start:]])
+            part_summary="##".join([x for x in text.split('##')[start:]])
         else:
-            part_summary="\n\n".join([x for x in text.split('##\n\n')[start:end]])
+            part_summary="##".join([x for x in text.split('##')[start:end]])
         sec_partial_summary.append(part_summary)
     return sec_partial_summary
 
@@ -1266,12 +1300,12 @@ def summarize_context(params):
             token_length=len(encoding.encode(text))
             chunking_needed=token_length>6000
         elif "mistral" in params['model_name'].lower():
-            tkn=token_counter('"mistralai/Mistral-7B-v0.1"')
+            tkn=token_counter("mistralai/Mistral-7B-v0.1")
             token_length=len(tkn.encode(text))
             chunking_needed=token_length>7000
         tic = time.time()        
         container_summ=st.empty()
-        stream_handler = StreamHandler(container_summ)
+   
         if chunking_needed:
             container_summ.write("Chunking documents...")
             params['max_len']=round(params['first_token_length'])
@@ -1281,11 +1315,11 @@ def summarize_context(params):
             results = pool.starmap(first_summ, [(params, section) for section in sections])
             pool.close()
             pool.join() 
-            text = "\n\n".join(results) 
+            text = "##".join(results) 
             
             word_length=len(text.split())     
-            if word_length>max(params['chunk_len']*3,3000): # Check if further chunking is need if text is greater than 3000 words
-                sec_partial_summary=sec_chunking(word_length,text)
+            if word_length>max(params['chunk_len']*3,500) if "mistral" in params['model_name'].lower() else max(params['chunk_len']*3,2000): # Check if further chunking is need if text is greater than 3000 words
+                sec_partial_summary=sec_chunking(word_length,text,params)
                 params['max_len']=round(params['first_token_length'])
                 pool = multiprocessing.Pool(processes=num_concurrent_invocations)              
                 final_results = pool.starmap(first_summ, [(params, summ) for summ in sec_partial_summary]) 
@@ -1293,20 +1327,20 @@ def summarize_context(params):
                 pool.join()   
                 #Final summary
                 full_summary=[] 
-                full_summary="\n\n".join([x for x in final_results])
+                full_summary="##".join([x for x in final_results])
                 params['prompt']=full_summary
                 params['max_len']=round(params['second_token_length'])
-                summary=summarize_final(params,[stream_handler])
+                summary=summarize_final(params,container_summ)
             else:
                 ## Final Summary
                 params['prompt']=text
                 params['max_len']=round(params['second_token_length'])
-                summary=summarize_final(params,[stream_handler])
+                summary=summarize_final(params,container_summ)
         else:
             ## No Chunking Needed Summary
             params['prompt']=text
             params['max_len']=round(params['second_token_length'])
-            summary=summarize_final(params,[stream_handler])
+            summary=summarize_final(params,container_summ)
         toc = time.time()
         st.session_state['elapsed'] = round(toc-tic, 1)
         ## Create pdf of summary text
@@ -1417,11 +1451,10 @@ def page_summary(pdf_file,params):
             with tab2:      
                 ## Summarize current doc page
                 container_tab=st.empty()
-                if st.button('Summarize',type="primary",key='summ'):                     
-                    stream_handler = StreamHandler(container_tab)
+                if st.button('Summarize',type="primary",key='summ'): 
                     image_b=pix.tobytes("png", 100)
                     text, bbox=extract_text_single(image_b)
-                    summary, input_tok, output_tok=summarize_sect(params, text, [stream_handler])                
+                    summary, input_tok, output_tok=summarize_sect(params, text, container_tab)                
                     st.session_state['page_summ']=summary
                 container_tab.markdown(st.session_state['page_summ'].replace("$","USD ").replace("%", " percent"))
 
@@ -1494,12 +1527,12 @@ def action_doc(params):
         if round(params["K"])>1 and params['method']=="single-passages":
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
-                stream_handler = StreamHandler(message_placeholder)
+
                 if "Kendra" in params["rag"]:
                     response=query_index(prompt)  
                 elif "OpenSearch" in params["rag"]:            
                     response=similarity_search(prompt, params) 
-                output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params,[stream_handler])
+                output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params,message_placeholder)
                 message_placeholder.markdown(output_answer[0]['Answer'].replace("$","USD ").replace("%", " percent"))
                 with st.expander(label="**Metadata**"):             
                     steps=f"""
@@ -1531,13 +1564,13 @@ def action_doc(params):
         else:    
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
-                stream_handler = StreamHandler(message_placeholder)
+   
                 if "Kendra" in params["rag"]:
                     response=query_index(prompt)  
                 elif "OpenSearch" in params["rag"]:            
                     response=similarity_search(prompt, params)   
 
-                output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params,[stream_handler])
+                output_answer=doc_qna_endpoint(params['endpoint-llm'], response, prompt,params,message_placeholder)
                 message_placeholder.markdown(output_answer[0]['Answer'].replace("$","USD ").replace("%", " percent"))
                 if 'single-passages' in params['method']:
                     links= f"[1]({output_answer[0]['Link']})"
