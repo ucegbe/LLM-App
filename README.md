@@ -20,24 +20,20 @@ You would need to set up the following before succesfully using this app:
 2. [Create OpenSearch Domain](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/createupdatedomains.html)
    - For the opensearch domain, Enable `fine-grained access control` and **Set IAM ARN as master user**.
    - For Access policy, select **Only use fine-grained access control**
-3. [Create Amazon Secrets to store OpenSearch Credentials](https://docs.aws.amazon.com/secretsmanager/latest/userguide/create_secret.html). Secrets should be stored as a key/pair value like {"username":`opensearch_username`,"password":`opensearch_password`}.
-3. [Deploy LLama2 Models on Amazon SageMaker](https://www.philschmid.de/sagemaker-llama-llm) (Optional)
-4. [Deploy HuggingFace Models with Amazon SageMaker JumpStart](https://www.philschmid.de/sagemaker-llama-llm) (Optional)
-5. Amazon Bedrock Access.
-6. Deploy HuggingFace Embedding Models with SageMaker JumpStart (Optional)
-7. [Create an Amazon DyanmoBD Table with UserID as primary Key](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/getting-started-step-1.html) (Optional)
-8. Modify the application_metadata_complete.json file with the correct values of your AWS account:
-    - llama2-7b value of sagemaker endpoint name **
-    - llama2-70b value of sagemaker endpoint name **
+3. [Deploy HuggingFace Models with Amazon SageMaker JumpStart](https://www.philschmid.de/sagemaker-llama-llm) (Optional)
+4. Amazon Bedrock Access.
+5. Deploy HuggingFace Embedding Models with SageMaker JumpStart (Optional)
+6. [Create an Amazon DyanmoBD Table with UserID as primary Key](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/getting-started-step-1.html) (Optional)
+7. Modify the application_metadata_complete.json file with the correct values of your AWS account:
+    - llama2-7b value of sagemaker endpoint name **    
     - embedding model values of sagemaker endpoint name (other than cohere and titan keys) **
     - HuggingFace api token for hugginfacekey value **
     - Kendra bucket and prefix values where uploaded file would be stored in Amazon S3
     - Kendra execution role value
     - Kendra index value 
     - Kendra S3 data source name
-    - Amazon OpenSearch parameters (domain endpoint, username, password and domain name prefix for created domains)
-    - Digital certificate path (tls_cert_path)**
-    - Amazon Secrets name for Amazon OpenSearch credentials
+    - Amazon OpenSearch parameters (domain endpoint **e.g. my-test-domain.us-east-1.es.amazonaws.com**)
+    - Digital certificate path (tls_cert_path)**   
     
     ** Optional 
     
